@@ -1,0 +1,5 @@
+/lib/
+/bin/
+/.shards.info
+shard.override.yml
+*.dwarf

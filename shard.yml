@@ -1,0 +1,23 @@
+name: rad_lambda
+version: 0.1.0
+
+authors:
+  - Corey Morello <cmorello@weatherflow.com>
+
+description: |
+  S3-triggered lambda that turns an MRMS precip grib2(.gz) into a RAD file:
+  in-process GDALWarp to EPSG:3857 at a fixed pixel density, RLE-encoded RAD out.
+
+dependencies:
+  # NOTE: requires the GDALWarp + VSIFWriteL bindings — push lib_gdal before
+  # building the docker image. Local dev resolves via shard.override.yml.
+  lib_gdal:
+    github: crmorello/lib_gdal
+
+targets:
+  rad_lambda:
+    main: src/rad_lambda.cr
+
+crystal: '>= 1.11.2'
+
+license: MIT
