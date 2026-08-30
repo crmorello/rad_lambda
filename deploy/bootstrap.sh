@@ -10,8 +10,19 @@ HOURS="${1:-3}"
 NOW=$(date -u +%s)
 CUTOFF=$((NOW - HOURS * 3600))
 
+# Every UTC day folder from cutoff to now (was: hardcoded yesterday+today,
+# which silently capped backfills at ~48h regardless of HOURS).
+DAYS=""
+t=$CUTOFF
+while [ "$t" -le "$NOW" ]; do
+  DAYS="$DAYS $(date -u -r "$t" +%Y%m%d 2>/dev/null || date -u -d "@$t" +%Y%m%d)"
+  t=$((t + 86400))
+done
+DAYS="$DAYS $(date -u +%Y%m%d)"
+DAYS=$(echo "$DAYS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+
 for region in "${REGION_PREFIXES[@]}"; do
-  for day in $(date -u -v-1d +%Y%m%d 2>/dev/null || date -u -d yesterday +%Y%m%d) $(date -u +%Y%m%d); do
+  for day in $DAYS; do
     prefix="${region}/SeamlessHSR_00.00/${day}/"
     aws s3api list-objects-v2 --bucket "$NOAA_BUCKET" --prefix "$prefix" \
       --query 'Contents[].Key' --output text 2>/dev/null | tr '\t' '\n' | while read -r key; do
@@ -27,10 +38,15 @@ for region in "${REGION_PREFIXES[@]}"; do
               date -u -d "${stamp:0:4}-${stamp:4:2}-${stamp:6:2} ${stamp:9:2}:${min}:${sec}" +%s)
       [ "$epoch" -lt "$CUTOFF" ] && continue
       echo "backfill: $key"
+      # Single-quoted printf template, built into a variable BEFORE the aws
+      # call: macOS /bin/bash is 3.2, whose parser leaks nested double quotes
+      # inside "$(...)" — the JSON's {a,b} braces then brace-expand and the
+      # payload arrives as two mangled arguments. Assignment context is safe.
+      payload=$(printf '{"Records":[{"s3":{"bucket":{"name":"%s"},"object":{"key":"%s"}}}]}' \
+        "$NOAA_BUCKET" "$key" | base64)
       aws lambda invoke --function-name "$FUNCTION_NAME" \
         --invocation-type Event \
-        --payload "$(echo "{\"Records\":[{\"s3\":{\"bucket\":{\"name\":\"${NOAA_BUCKET}\"},\"object\":{\"key\":\"${key}\"}}}]}" | base64)" \
-        /dev/null >/dev/null
+        --payload "$payload" /dev/null > /dev/null
     done
   done
 done

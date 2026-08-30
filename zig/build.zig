@@ -1,0 +1,33 @@
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // GDAL location — homebrew by default; override for docker/linux:
+    //   zig build -Dgdal-include=/usr/include/gdal -Dgdal-lib=/usr/lib/...
+    const gdal_include = b.option([]const u8, "gdal-include", "GDAL include dir") orelse "/opt/homebrew/include";
+    const gdal_lib = b.option([]const u8, "gdal-lib", "GDAL library dir") orelse "/opt/homebrew/lib";
+
+    const radcore = b.dependency("radcore", .{});
+
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "radcore", .module = radcore.module("radcore") },
+        },
+    });
+    mod.addIncludePath(.{ .cwd_relative = gdal_include });
+    mod.addLibraryPath(.{ .cwd_relative = gdal_lib });
+    mod.linkSystemLibrary("gdal", .{});
+
+    const exe = b.addExecutable(.{ .name = "rad_lambda", .root_module = mod });
+    b.installArtifact(exe);
+
+    const tests = b.addTest(.{ .root_module = mod });
+    const run_tests = b.addRunArtifact(tests);
+    b.step("test", "Run unit tests").dependOn(&run_tests.step);
+}

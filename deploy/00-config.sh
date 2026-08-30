@@ -3,13 +3,14 @@
 
 export AWS_REGION="us-east-1"
 
-# --- names (change BUCKET before first deploy: S3 names are global) ---------
-export RAD_BUCKET="tempest-radar-rads"          # output bucket
+# --- names (as deployed 2026-07-31: ops named bucket, function, and ECR repo
+# all "tempest-radar-output") ------------------------------------------------
+export RAD_BUCKET="tempest-radar-output"        # output bucket
 export RAD_PREFIX="rads"                        # key prefix for .rad + manifest
 export QUEUE_NAME="mrms-seamlesshsr"
 export DLQ_NAME="mrms-seamlesshsr-dlq"
-export FUNCTION_NAME="rad-lambda"
-export ECR_REPO="rad-lambda"
+export FUNCTION_NAME="tempest-radar-output"
+export ECR_REPO="tempest-radar-output"
 export ALARM_TOPIC_NAME="radar-backend-alarms"  # SNS topic for alarm emails
 
 # --- upstream (verified 2026-07-14/15) ---------------------------------------

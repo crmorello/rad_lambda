@@ -3,3 +3,5 @@
 /.shards.info
 shard.override.yml
 *.dwarf
+zig/.zig-cache/
+zig/zig-out/

@@ -1,0 +1,44 @@
+flowchart LR
+    dev["Corey<br/>docker build (arm64,<br/>radcore via build-context)"]
+
+    subgraph noaa["NOAA public (us-east-1)"]
+        mrms[("noaa-mrms-pds S3<br/>SeamlessHSR grib2.gz<br/>every 2 min x 4 regions")]
+        sns["SNS NewMRMSObject"]
+        mrms -- "new object" --> sns
+    end
+
+    subgraph ingest["Ingest — ops item 4"]
+        sqs["SQS rad-lambda-events<br/>filter: SeamlessHSR<br/>CONUS ALASKA HAWAII CARIB"]
+        dlq["DLQ<br/>alarm on depth > 0"]
+        sqs -. "3 failed receives" .-> dlq
+    end
+    sns -- "cross-account<br/>subscription" --> sqs
+
+    subgraph compute["Compute — ops items 1, 5, 6, 7"]
+        ecr["ECR rad-lambda"]
+        lambda["Lambda rad-lambda<br/>arm64 · 2048 MB · 60 s · conc 10<br/>Zig bootstrap + radcore RAD2 encoder<br/>skips off-grid stamps (min % 10 != 0)"]
+        cw["CloudWatch<br/>logs 14 d · error alarms"]
+        ecr -- "container image" --> lambda
+        lambda --> cw
+    end
+    dev -- "push image" --> ecr
+    sqs -- "event source mapping<br/>batch size 1" --> lambda
+    lambda -- "read grib<br/>/vsigzip/ /vsis3/" --> mrms
+
+    subgraph serving["Serving — ops items 2, 3"]
+        out[("output bucket /rads<br/>gzip + Content-Encoding<br/>7-day lifecycle")]
+        cf["CloudFront (OAC)<br/>manifest.json TTL 30 s<br/>*.rad long TTL · compression OFF"]
+        out --> cf
+    end
+    lambda -- "PUT stamp.rad<br/>rebuild manifest.json" --> out
+    cf --> client["raydare client<br/>radcore decode + render"]
+
+    subgraph phase2["Phase 2 — not in this deploy"]
+        mp["mixedPhase feed -> S3<br/>(today: EC2 local disk)"]
+        ec2["EC2 data_manager<br/>runs in parallel until then"]
+    end
+    mp -. "temp/dew masks for<br/>typed RADs (radcore classify)" .-> lambda
+
+    style phase2 stroke-dasharray: 5 5
+    style ec2 stroke-dasharray: 5 5
+    style mp stroke-dasharray: 5 5

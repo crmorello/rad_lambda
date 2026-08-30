@@ -1,0 +1,16 @@
+.{
+    .name = .rad_lambda,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0xb94dc10a7767ccfb,
+    .dependencies = .{
+        // radcore is THE shared core (raydare §14) — same RAD encode/decode
+        // the client renders from. Path dep until radcore gets its own repo.
+        .radcore = .{ .path = "../../../../Swift/Playgrounds/raydare/radcore" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

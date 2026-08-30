@@ -18,12 +18,22 @@ module RadLambda
       idx ? id[(idx + 1)..] : id
     end
 
+    # Manifest window: only list frames within this span of the newest stamp.
+    # The bucket keeps more (lifecycle expires at 1 day), but an unbounded
+    # manifest made fresh clients download hundreds of frames their retention
+    # sweep deleted moments later.
+    WINDOW = 4.hours
+
     # Manifest JSON for a set of frame ids. `url_prefix` is the serving path
     # of the output dir ("" or "/rads" — no trailing slash).
     def self.build(ids : Array(String), url_prefix : String) : String
       sorted = ids.sort do |a, b|
         cmp = stamp_of(a) <=> stamp_of(b)
         cmp == 0 ? (a <=> b) : cmp
+      end
+      if newest = sorted.last?
+        floor = Time.parse_utc(stamp_of(newest), STAMP_FORMAT) - WINDOW
+        sorted = sorted.select { |id| Time.parse_utc(stamp_of(id), STAMP_FORMAT) >= floor }
       end
       frames = sorted.map do |id|
         time = Time.parse_utc(stamp_of(id), STAMP_FORMAT).to_rfc3339
