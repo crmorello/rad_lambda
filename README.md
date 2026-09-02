@@ -4,7 +4,7 @@ S3-triggered lambda: MRMS precip grib2(.gz) in, RAD file out.
 
 **Implementation: Zig (`zig/`), sharing radcore with raydare** (§14 one
 language, all layers): the RAD v2 encoder lives in
-`raydare/radcore/src/core.zig` next to the decoder the client renders from —
+`radcore/src/core.zig` (its own repo, github.com/crmorello/radcore) next to the decoder the client renders from —
 one implementation of the format, parity-pinned. (The original Crystal build
 was removed once the Zig output was verified byte-identical to it, golden-tested
 per region; see git history before Sep 2026 if the reference is ever needed.)
@@ -45,13 +45,35 @@ via VSI (local path or `/vsis3/bucket/prefix`).
     zig build test
     zig build -Doptimize=ReleaseFast     # zig-out/bin/rad_lambda
 
-radcore resolves via a relative path dep to
-`~/Developer/Swift/Playgrounds/raydare/radcore` (see `zig/build.zig.zon`) —
-extract radcore to its own repo to durably break that coupling. GDAL comes
+radcore resolves via a relative path dep to the sibling checkout
+`~/Developer/Zig/radcore` (see `zig/build.zig.zon`); a url+hash package dep
+replaces it once radcore ships. GDAL comes
 from homebrew by default; override with `-Dgdal-include=... -Dgdal-lib=...`.
 
-Docker image (the deployable): see `Dockerfile` — needs
-`--build-context radcore=...` for radcore.
+### Container images
+
+Two images, because GDAL is built from source and should not be recompiled on
+every app build:
+
+    scripts/build_gdal_base.sh      # rare: rebuilds the minimal GDAL base
+    scripts/build_and_push.sh       # normal: compiles the zig binary, pushes
+
+`Dockerfile.gdal` builds GDAL 3.11.4 + PROJ 9.6.1 with just the three drivers
+this lambda uses (GRIB in, MEM warp target, Parquet for obs) into `/opt/gdal`,
+and emits two tags: `-build` (headers + zig toolchain) and `-runtime` (libs
+only). `Dockerfile` then just compiles the binary against the first and ships
+it on the second — it needs `--build-context radcore=...` for radcore.
+
+This replaced `ghcr.io/osgeo/gdal:ubuntu-full-3.11.4`, which carried ~250
+drivers, Python + numpy, HDF5, netCDF, PostgreSQL, Poppler and Xerces:
+**1.85 GB -> 221 MB**, drivers registered per cold start ~250 -> 12. Parquet is
+a deferred plugin (GDAL RFC 96), so the radar path never dlopens Arrow while
+`hasParquetDriver()` still reports it available.
+
+Versions are pinned to match the OSGeo image exactly because the RADs in the
+bucket were minted by its warp kernel — `scripts/verify_parity.sh` cmps output
+against a reference image and must stay byte-identical. See
+`docs/gdal-base-image.md`.
 
 Base-only RADs for now — mixed-phase typing (temp/dew masks) is the known
 next step and changes this to a multi-input handler (port it into radcore

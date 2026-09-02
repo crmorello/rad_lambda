@@ -11,6 +11,8 @@ export QUEUE_NAME="mrms-seamlesshsr"
 export DLQ_NAME="mrms-seamlesshsr-dlq"
 export FUNCTION_NAME="tempest-radar-output"
 export ECR_REPO="tempest-radar-output"
+export GDAL_BASE_REPO="tempest-gdal-base"   # minimal GDAL base (Dockerfile.gdal)
+export GDAL_BASE_VERSION="3.11.4"           # pinned: warp-kernel parity with shipped RADs
 export ALARM_TOPIC_NAME="radar-backend-alarms"  # SNS topic for alarm emails
 
 # --- upstream (verified 2026-07-14/15) ---------------------------------------

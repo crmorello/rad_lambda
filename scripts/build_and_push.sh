@@ -7,7 +7,8 @@
 #   SKIP_DEPLOY=1 to push without updating the lambda function.
 #   Overrides: ECR_ACCOUNT, AWS_REGION, ECR_REPO, RADCORE_DIR, FUNCTION_NAME.
 #
-# Requires: docker, zig, aws CLI with push permissions on the repo and
+# Requires: the GDAL base image (scripts/build_gdal_base.sh), docker, zig,
+# and an aws CLI with push permissions on the repo and
 # lambda:UpdateFunctionCode on the function.
 # Full local validation (MinIO + RIE) is separate: test/e2e_local.sh
 set -euo pipefail
@@ -17,7 +18,7 @@ ACCOUNT="${ECR_ACCOUNT:-960102610069}"
 REGION="${AWS_REGION:-us-east-1}"
 REPO="${ECR_REPO:-tempest-radar-output}"
 FUNCTION="${FUNCTION_NAME:-tempest-radar-output}"
-RADCORE="${RADCORE_DIR:-$HOME/Developer/Swift/Playgrounds/raydare/radcore}"
+RADCORE="${RADCORE_DIR:-$HOME/Developer/Zig/radcore}"
 TAG="${1:-v$(date -u +%Y%m%d-%H%M%S)}"
 URI="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com/$REPO"
 
@@ -26,10 +27,21 @@ if [ "${SKIP_TESTS:-}" != "1" ]; then
   (cd zig && zig build test)
 fi
 
+# The minimal GDAL base is built separately and rarely (scripts/build_gdal_base.sh).
+# Fail loudly rather than letting docker emit a confusing "pull access denied".
+GDAL_BASE="${GDAL_BASE:-rad-gdal-base:3.11.4}"
+for t in build runtime; do
+  if ! docker image inspect "$GDAL_BASE-$t" >/dev/null 2>&1; then
+    echo "missing GDAL base image: $GDAL_BASE-$t" >&2
+    echo "build it first:  scripts/build_gdal_base.sh" >&2
+    exit 1
+  fi
+done
+
 echo "== docker build (arm64)"
-docker build \
+docker build --platform linux/arm64 \
   --build-context radcore="$RADCORE" \
-  --build-arg ZIG_ARCH=aarch64 \
+  --build-arg "GDAL_BASE=$GDAL_BASE" \
   -t rad-lambda:local .
 
 echo "== ecr login"

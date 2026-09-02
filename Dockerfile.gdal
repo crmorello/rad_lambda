@@ -1,0 +1,214 @@
+# syntax=docker/dockerfile:1
+#
+# Pre-packaged minimal GDAL for rad_lambda. Built rarely (only when a version
+# below changes), pushed to ECR, and consumed by ./Dockerfile — so the app
+# build stays seconds instead of recompiling GDAL.
+#
+# Two targets come out of this file:
+#   --target build   -> rad-gdal-base:<ver>-build    (GDAL + headers + zig)
+#   --target runtime -> rad-gdal-base:<ver>-runtime  (GDAL libs only, no toolchain)
+# Use scripts/build_gdal_base.sh, which builds both and smoke-tests the drivers.
+#
+# Why a custom build: ghcr.io/osgeo/gdal:ubuntu-full ships ~250 drivers, Python
+# + numpy, HDF5, netCDF, PostgreSQL, Poppler and Xerces (1.85 GB). This lambda
+# uses three drivers.
+#
+# Versions match ghcr.io/osgeo/gdal:ubuntu-full-3.11.4 EXACTLY (GDAL 3.11.4,
+# PROJ 9.6.1) because the RADs already in the bucket were minted by its warp
+# kernel and the format contract is byte-identical output (README "parity
+# gate"). scripts/verify_parity.sh proves it against a reference RAD.
+#
+# LAYER DISCIPLINE MATTERS HERE. Deleting a file in a later RUN only writes a
+# whiteout — the bytes stay in the lower layer and ECR still pulls them. So
+# every "install then strip down" pair below happens inside ONE RUN, and
+# /opt/gdal is pruned in the build stage BEFORE it is COPY'd.
+ARG DEBIAN_TAG=trixie-slim
+ARG GDAL_VERSION=3.11.4
+ARG PROJ_VERSION=9.6.1
+ARG ZIG_VERSION=0.16.0
+ARG ZIG_ARCH=aarch64
+
+# ---------------------------------------------------------------------------
+# rt-deps: the small shared base — the libraries BOTH targets need, plus
+# Apache's Arrow apt source. Arrow itself is deliberately NOT installed here:
+# the build stage wants the -dev packages and the runtime stage has to install
+# the runtime packages and purge Qt5 in a single layer (see runtime below), so
+# sharing an Arrow layer would defeat that.
+#
+# PROJ is deliberately NOT from apt either: Debian's libproj25 hard-depends on
+# proj-data (24 MB of datum grids) plus libcurl3t64-gnutls and libtiff6, none
+# of which this lambda can reach — the one transform is analytical
+# (WGS84 -> EPSG:3857). Building it in the next stage drops ~29 MB and pins
+# 9.6.1 to match the reference image instead of Debian's 9.6.0.
+# ---------------------------------------------------------------------------
+FROM debian:${DEBIAN_TAG} AS rt-deps
+SHELL ["/bin/sh", "-eux", "-c"]
+RUN apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl gpgv; \
+    # UNPACK the arrow apt-source deb rather than installing it: the deb is
+    # two files (a .sources and a keyring) but Depends: gnupg, which drags in
+    # pinentry-qt -> Qt5 -> ICU. apt verifies the repo with gpgv and the
+    # keyring the deb carries, so the files alone are enough.
+    curl -fsSL -o /tmp/arrow-apt-source.deb \
+      https://packages.apache.org/artifactory/arrow/debian/apache-arrow-apt-source-latest-trixie.deb; \
+    dpkg -x /tmp/arrow-apt-source.deb /; \
+    rm /tmp/arrow-apt-source.deb; \
+    apt-get install -y --no-install-recommends \
+      libcurl4 libsqlite3-0 libopenjp2-7 libh3-1 zlib1g; \
+    rm -rf /var/lib/apt/lists/* /usr/share/doc /usr/share/man \
+           /usr/share/locale /usr/share/info
+
+# ---------------------------------------------------------------------------
+# build: rt-deps + toolchain + PROJ + GDAL from source + zig. Never shipped,
+# so size here is irrelevant — only /opt/gdal is copied out.
+# ---------------------------------------------------------------------------
+FROM rt-deps AS build
+SHELL ["/bin/sh", "-eux", "-c"]
+RUN apt-get update; \
+    apt-get install -y --no-install-recommends \
+      build-essential cmake ninja-build pkg-config xz-utils sqlite3 \
+      libsqlite3-dev libcurl4-openssl-dev libopenjp2-7-dev zlib1g-dev \
+      libh3-dev libarrow-dev libparquet-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+# --- PROJ ------------------------------------------------------------------
+# ENABLE_CURL=OFF drops PROJ networking, ENABLE_TIFF=OFF drops GeoTIFF grid
+# support; neither is reachable with only EPSG:3857. projsync is the one app
+# that hard-requires curl, so it is dropped explicitly. Leaves proj.db (~9 MB)
+# as the sole data file. BUILD_APPS keeps projinfo for debugging (the runtime
+# target copies lib/ and share/ only).
+ARG PROJ_VERSION
+RUN mkdir -p /src/proj; \
+    curl -fsSL https://download.osgeo.org/proj/proj-${PROJ_VERSION}.tar.gz \
+      | tar -xz -C /src/proj --strip-components=1; \
+    cmake -S /src/proj -B /bld/proj -GNinja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/gdal \
+      -DBUILD_APPS=ON \
+      -DBUILD_PROJSYNC=OFF \
+      -DBUILD_TESTING=OFF \
+      -DENABLE_CURL=OFF \
+      -DENABLE_TIFF=OFF; \
+    cmake --build /bld/proj --parallel "$(nproc)"; \
+    cmake --install /bld/proj; \
+    rm -rf /bld/proj /src/proj
+
+# --- GDAL ------------------------------------------------------------------
+# Driver set, derived from the source (see docs/gdal-base-image.md):
+#   GRIB    raster in  - main.zig:86-88. MRMS GRIB2 is DRS template 41 (PNG),
+#                        verified by parsing a real fixture's section 5, so
+#                        internal libpng is REQUIRED, not optional.
+#   MEM     raster out - gdal.zig:76, the "-of MEM" warp target
+#   Parquet vector in  - obs.zig:143, built as a DEFERRED plugin (RFC 96): a
+#                        stub proxy lives in libgdal and the real .so is only
+#                        dlopen'd when a file matches, so the radar path never
+#                        pays for Arrow. ARROWDATASET is off because
+#                        obs.zig:153 opens a single file, never a dataset scan.
+#   JP2OpenJPEG        - ~250 KB of insurance for GRIB DRS template 40 on some
+#                        future MRMS product. Drop it if you want the space.
+# GDAL_USE_EXTERNAL_LIBS=OFF flips the default for all ~40 GDAL_USE_<dep>
+# options at once; only what we need is switched back on. That is what keeps
+# HDF5/netCDF/Poppler/Xerces/PostgreSQL out without naming them.
+# GEOS is off because the code makes zero OGR_G_* calls (obs.zig:293
+# rasterizes H3 hexagons itself).
+ARG GDAL_VERSION
+RUN mkdir -p /src/gdal; \
+    curl -fsSL https://github.com/OSGeo/gdal/releases/download/v${GDAL_VERSION}/gdal-${GDAL_VERSION}.tar.gz \
+      | tar -xz -C /src/gdal --strip-components=1; \
+    cmake -S /src/gdal -B /bld/gdal -GNinja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/gdal \
+      -DCMAKE_PREFIX_PATH=/opt/gdal \
+      -DGDAL_BUILD_OPTIONAL_DRIVERS=OFF \
+      -DOGR_BUILD_OPTIONAL_DRIVERS=OFF \
+      -DGDAL_USE_EXTERNAL_LIBS=OFF \
+      -DGDAL_ENABLE_DRIVER_GRIB=ON \
+      -DGDAL_ENABLE_DRIVER_JP2OPENJPEG=ON \
+      -DOGR_ENABLE_DRIVER_PARQUET=ON \
+      -DOGR_ENABLE_DRIVER_PARQUET_PLUGIN=ON \
+      -DGDAL_USE_PNG_INTERNAL=ON \
+      -DGDAL_USE_ZLIB=ON \
+      -DGDAL_USE_CURL=ON \
+      -DGDAL_USE_OPENJPEG=ON \
+      -DGDAL_USE_ARROW=ON \
+      -DGDAL_USE_PARQUET=ON \
+      -DGDAL_USE_ARROWDATASET=OFF \
+      -DGDAL_USE_GEOS=OFF \
+      -DBUILD_PYTHON_BINDINGS=OFF \
+      -DBUILD_JAVA_BINDINGS=OFF \
+      -DBUILD_CSHARP_BINDINGS=OFF \
+      -DBUILD_TESTING=OFF \
+      -DBUILD_DOCS=OFF \
+      -DBUILD_APPS=ON; \
+    cmake --build /bld/gdal --parallel "$(nproc)"; \
+    cmake --install /bld/gdal; \
+    strip --strip-unneeded /opt/gdal/lib/*.so.* /opt/gdal/lib/gdalplugins/*.so; \
+    # Prune here, not after the COPY in the runtime stage — a later delete
+    # would leave the bytes in the copied layer.
+    rm -rf /opt/gdal/lib/cmake /opt/gdal/lib/pkgconfig /opt/gdal/lib/*.a; \
+    rm -rf /bld /src; \
+    du -sh /opt/gdal/lib /opt/gdal/share
+
+ARG ZIG_VERSION
+ARG ZIG_ARCH
+RUN curl -fsSL https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz \
+      | tar -xJ -C /opt; \
+    ln -s /opt/zig-*/zig /usr/local/bin/zig; \
+    zig version
+
+# ---------------------------------------------------------------------------
+# runtime: rt-deps + Arrow runtime + GDAL/PROJ libs and data. No compiler, no
+# headers, no zig.
+# ---------------------------------------------------------------------------
+FROM rt-deps AS runtime
+SHELL ["/bin/sh", "-eux", "-c"]
+# Install Arrow and drop Qt5 in ONE layer, or the purged bytes stay in the
+# image. Debian ships libthrift, libthriftnb, libthriftz AND libthriftqt5 in
+# one package, so libparquet's dep on it drags in Qt5 -> ICU + glib +
+# shared-mime-info: ~56 MB for a 67 KB library nothing here loads. Only
+# libthriftqt5-*.so links Qt (verified with objdump -p); libthrift-*.so, the
+# one Parquet actually needs, links just ssl/crypto/stdc++. So let apt resolve
+# the real dependency closure, then drop the Qt half — and prove the ELF
+# closure still holds further down.
+RUN apt-get update; \
+    # The Arrow runtime package name tracks the release soname (libarrow2500
+    # for 25.0.1), so discover it rather than pinning a name that dies on the
+    # next bump. apt-cache search takes a POSIX EXTENDED regex.
+    ARROW=$(apt-cache search --names-only '^libarrow[0-9]+$' | awk '{print $1}' | sort -V | tail -1); \
+    PARQUET=$(echo "$ARROW" | sed 's/libarrow/libparquet/'); \
+    test -n "$ARROW"; \
+    echo "arrow runtime packages: $ARROW $PARQUET"; \
+    apt-get install -y --no-install-recommends "$ARROW" "$PARQUET"; \
+    rm -f /usr/lib/*/libthriftqt5-*.so*; \
+    dpkg --purge --force-depends \
+      libqt5network5t64 libqt5dbus5t64 libqt5core5t64 \
+      libicu76 shared-mime-info libglib2.0-0t64; \
+    rm -rf /var/lib/apt/lists/* /usr/share/doc /usr/share/man \
+           /usr/share/locale /usr/share/info
+
+COPY --from=build /opt/gdal/lib   /opt/gdal/lib
+COPY --from=build /opt/gdal/share /opt/gdal/share
+
+# GDAL_DATA and PROJ_DATA are load-bearing and NEW: the code never calls
+# CPLSetConfigOption (there is none in gdal.zig), so until now it coasted on
+# the OSGeo image's baked-in defaults. Get these wrong and the EPSG:3857
+# lookup at gdal.zig:76 fails at runtime.
+# GDAL_DRIVER_PATH is safe to set because Parquet is a deferred plugin — the
+# directory is scanned but nothing is dlopen'd until a file matches.
+ENV GDAL_DATA=/opt/gdal/share/gdal \
+    PROJ_DATA=/opt/gdal/share/proj \
+    PROJ_NETWORK=OFF \
+    GDAL_DRIVER_PATH=/opt/gdal/lib/gdalplugins \
+    LD_LIBRARY_PATH=/opt/gdal/lib \
+    GDAL_PAM_ENABLED=NO \
+    CPL_TMPDIR=/tmp \
+    GDAL_CACHEMAX=256
+
+# The Qt5 purge above is surgical, so prove the ELF closure is still complete
+# here rather than discovering a missing .so during a lambda cold start. Runs
+# after ENV so LD_LIBRARY_PATH can resolve /opt/gdal/lib. Adds no layer bytes.
+RUN missing=$(ldd /opt/gdal/lib/libgdal.so.* /opt/gdal/lib/libproj.so.* \
+                  /opt/gdal/lib/gdalplugins/*.so 2>&1 \
+              | grep "not found" | sort -u || true); \
+    if [ -n "$missing" ]; then echo "MISSING SHARED LIBS:"; echo "$missing"; exit 1; fi; \
+    echo "shared library closure OK"

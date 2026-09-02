@@ -16,7 +16,7 @@ pub const CONUS_PIXEL_SIZE_M: f64 = 1222.8;
 pub var gzip_output = false;
 
 /// Precompute .flw flow sidecars at ingest (RAD_FLOW=0 opts out). Spec:
-/// raydare/docs/flw-format.md — the flow ending at frame X.rad is X.flw.
+/// radcore/docs/flw-format.md — the flow ending at frame X.rad is X.flw.
 pub var flow_enabled = true;
 
 /// The pipeline's slice cadence: frames land on 10-minute boundaries, so the

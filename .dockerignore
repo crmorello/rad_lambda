@@ -1,0 +1,9 @@
+# 366 MB of zig build cache was being shipped into the builder stage on every
+# build, busting the layer cache each time. Nothing here is needed to compile.
+zig/.zig-cache/
+zig/zig-out/
+test/.cache/
+.git/
+docs/
+deploy/
+**/.DS_Store

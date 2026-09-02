@@ -1,50 +1,41 @@
 # Lambda container image (custom runtime): the Zig binary IS the bootstrap.
 #
-# radcore lives in the raydare repo — pass it as a named build context; it is
-# copied to a path that mirrors the local directory layout, so
-# build.zig.zon's relative path dep resolves unchanged:
+# GDAL comes from our own pre-packaged minimal base (Dockerfile.gdal, see
+# docs/gdal-base-image.md), NOT from ghcr.io/osgeo/gdal:ubuntu-full. That image
+# carried ~250 drivers, Python+numpy, HDF5, netCDF, PostgreSQL, Poppler and
+# Xerces for a lambda that uses three drivers — 1.85 GB of image, and a cold
+# start spent registering all of it. Build the base once, first:
+#
+#   scripts/build_gdal_base.sh
+#
+# radcore is its own repo (sibling checkout) — pass it as a named build
+# context; it is copied to a path that mirrors the local directory layout,
+# so build.zig.zon's relative path dep resolves unchanged:
 #
 #   docker build \
-#     --build-context radcore=$HOME/Developer/Swift/Playgrounds/raydare/radcore \
+#     --build-context radcore=$HOME/Developer/Zig/radcore \
 #     -t rad-lambda .
 #
-# Base: OSGeo's GDAL image, not Ubuntu's libgdal — the obs ingest reads
-# parquet through OGR and Ubuntu 24.04's libgdal 3.8 is built WITHOUT the
-# Parquet/Arrow driver (verified 2026-09-01). Both stages use the same image
-# so libgdal sonames match. H3 (obs hex rasterization) comes from apt.
-# For arm64 lambdas set ZIG_ARCH=aarch64 and build on/for arm64.
-ARG GDAL_IMAGE=ghcr.io/osgeo/gdal:ubuntu-full-3.11.4
+# The base image is arch-specific (it carries a linux zig toolchain); for
+# x86_64 rebuild it with ZIG_ARCH=x86_64 on an amd64 host.
+ARG GDAL_BASE=rad-gdal-base:3.11.4
 
-# The image ships Apache's Arrow apt source whose signing key is not in the
-# image (apt-get update fails: NO_PUBKEY); Arrow itself is already installed
-# and we add nothing from that repo, so drop the source before apt runs.
-FROM ${GDAL_IMAGE} AS build
-RUN rm -f /etc/apt/sources.list.d/apache-arrow.sources \
-    && apt-get update && apt-get install -y --no-install-recommends \
-      libh3-dev curl xz-utils ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-ARG ZIG_VERSION=0.16.0
-ARG ZIG_ARCH=x86_64
-RUN curl -fsSL https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz \
-      | tar -xJ -C /opt && ln -s /opt/zig-*/zig /usr/local/bin/zig
-
+FROM ${GDAL_BASE}-build AS build
 # Mirror the dev layout: rad_lambda/zig four levels below the root that also
-# holds Swift/Playgrounds/raydare (see build.zig.zon).
-COPY --from=radcore / /build/Swift/Playgrounds/raydare/radcore
+# holds Zig/radcore (see build.zig.zon).
+COPY --from=radcore / /build/Zig/radcore
 COPY zig /build/crystal/git/rad_lambda/zig
 WORKDIR /build/crystal/git/rad_lambda/zig
-# gdal-config --cflags is -I/usr/include in this image; libs are multiarch.
+# GDAL is under /opt/gdal in the base image. H3 stays on apt (Debian's
+# libh3-dev flattens h3api.h into /usr/include, unlike homebrew's h3/ nesting).
 RUN zig build -Doptimize=ReleaseFast \
-      -Dgdal-include=/usr/include \
-      -Dgdal-lib=/usr/lib/$(uname -m)-linux-gnu \
+      -Dgdal-include=/opt/gdal/include \
+      -Dgdal-lib=/opt/gdal/lib \
       -Dh3-include=/usr/include \
       -Dh3-lib=/usr/lib/$(uname -m)-linux-gnu
 
-FROM ${GDAL_IMAGE}
-RUN rm -f /etc/apt/sources.list.d/apache-arrow.sources \
-    && apt-get update && apt-get install -y --no-install-recommends \
-      libh3-1 ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+FROM ${GDAL_BASE}-runtime
 COPY --from=build /build/crystal/git/rad_lambda/zig/zig-out/bin/rad_lambda /var/runtime/bootstrap
-# RAD_OUTPUT (e.g. /vsis3/bucket/rads) is set on the function config
+# GDAL_DATA / PROJ_DATA / GDAL_DRIVER_PATH come from the runtime base image.
+# RAD_OUTPUT (e.g. /vsis3/bucket/rads) is set on the function config.
 ENTRYPOINT ["/var/runtime/bootstrap"]
