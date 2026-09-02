@@ -7,9 +7,11 @@
 //! lattice (origin snapped to multiples of the pixel size, so every product
 //! — radar included once its warp adopts `-tap` — shares a grid).
 //!
-//! CLI mode only for now (`rad_lambda --obs <file.parquet> [out_dir]`); the
-//! S3 trigger (`.parquet` key in handleEvent) is a later hook. Spec:
-//! raydare/docs/obs-product.md.
+//! Two entry points: the CLI (`rad_lambda --obs <file.parquet> [out_dir]`,
+//! plain bodies + unwindowed manifests) and the lambda, where handleEvent
+//! routes any `.parquet` key here (`kindForKey`) with gzip-at-rest and the
+//! RAD_MANIFEST_HOURS window. Obs runs as its OWN function off the shared
+//! image. Spec: raydare/docs/obs-product.md.
 const std = @import("std");
 const gdal = @import("gdal.zig");
 const manifest = @import("manifest.zig");
@@ -24,58 +26,24 @@ const log = std.log.scoped(.obs);
 pub const HALF_WORLD: f64 = 20037508.342789244;
 /// Index-map sentinel: pixel covered by no cell.
 pub const NONE: u32 = std.math.maxInt(u32);
-/// Obs manifests list every frame in the prefix (research data is not a
-/// rolling 10-minute window): ~400 days.
+/// Manifest window for CLI/research runs: ~400 days, i.e. "list every frame in
+/// the prefix". Deployed obs is a 5-minute product, so `ingest` takes the window
+/// as a parameter and the lambda passes `handler.manifestWindowMs()`
+/// (RAD_MANIFEST_HOURS, default 3) — at 288 issuances/day this constant would
+/// grow each of the 13 variable manifests without bound and make every
+/// manifest.rebuild LIST an ever-larger directory.
 pub const MANIFEST_WINDOW_MS: i64 = 400 * 86_400_000;
 
 // ---------------------------------------------------------------- encoding
-
-/// u8 encodings. 0 is always "absent" (the pipeline's load-bearing sentinel:
-/// RLE nodata, transparent in the shader); values clamp into 1..255.
-pub const Encoding = enum {
-    /// 1 + round((x + 40) * 2): -40..87 °C, 0.5 step
-    thermo,
-    /// 1 + round(x * 2.5): 0..100 %, 0.4 step
-    percent,
-    /// 1 + round((x - 950) * 2): 950..1077 hPa, 0.5 step
-    pressure,
-    /// 1 + round(x * 5): 0..50.8 m/s, 0.2 step
-    wind_speed,
-    /// atan2(sin, cos) -> 0..360°, 1 + round(deg / 1.5); sin = cos = 0 -> 0
-    wind_dir,
-    /// 1 + round(x / 5): 0..1270 W/m², 5 step
-    solar,
-    /// 1 + round(100 * log10(1 + x)): 0 -> 1, 300 mm/h -> 249
-    precip_rate,
-    /// raw categorical code (1..255); 0 stays absent
-    code,
-};
-
-pub const Product = struct {
-    name: [:0]const u8,
-    enc: Encoding,
-    /// Source column(s): one, or {sin, cos} for wind_dir.
-    fields: []const [:0]const u8,
-    /// Continuous fields are smoothed across cell plateaus before
-    /// quantization (see smoothField); categorical codes never are.
-    smooth: bool = true,
-};
-
-pub const products = [_]Product{
-    .{ .name = "temperature", .enc = .thermo, .fields = &.{"temperature"} },
-    .{ .name = "dewpoint", .enc = .thermo, .fields = &.{"dewpoint"} },
-    .{ .name = "rh", .enc = .percent, .fields = &.{"rh"} },
-    .{ .name = "pressure", .enc = .pressure, .fields = &.{"pressure"} },
-    .{ .name = "wind_average", .enc = .wind_speed, .fields = &.{"wind_average"} },
-    .{ .name = "wind_gust", .enc = .wind_speed, .fields = &.{"wind_gust"} },
-    .{ .name = "wind_dir", .enc = .wind_dir, .fields = &.{ "wind_dir_sin", "wind_dir_cos" } },
-    .{ .name = "solar_radiation", .enc = .solar, .fields = &.{"solar_radiation"} },
-    .{ .name = "precip_rate", .enc = .precip_rate, .fields = &.{"precip_rate"} },
-    .{ .name = "cloud_cover", .enc = .percent, .fields = &.{"cloud_cover"} },
-    .{ .name = "tempest_pres_obs", .enc = .pressure, .fields = &.{"tempest_pres_obs"} },
-    .{ .name = "precip_type", .enc = .code, .fields = &.{"precip_type"}, .smooth = false },
-    .{ .name = "conditions_code", .enc = .code, .fields = &.{"conditions_code"}, .smooth = false },
-};
+// The product table, quantizers and dequantizers live in radcore
+// (products.zig) — one source for the producer, the Swift client and the web.
+pub const Encoding = radcore.products.Encoding;
+pub const Product = radcore.products.Product;
+/// The obs products, in ramp-mode order (radcore.products.obs).
+pub const products = radcore.products.obs;
+pub const clampByte = radcore.products.clampByte;
+pub const quantize = radcore.products.quantize;
+pub const quantizeDir = radcore.products.quantizeDir;
 
 /// Every parquet column the products read, in Table column order.
 pub const field_names = [_][:0]const u8{
@@ -88,38 +56,6 @@ pub const field_names = [_][:0]const u8{
 fn fieldCol(name: []const u8) usize {
     for (field_names, 0..) |f, i| if (std.mem.eql(u8, f, name)) return i;
     unreachable; // products reference field_names only
-}
-
-/// round + clamp into 1..255; NaN -> 0.
-pub fn clampByte(v: f64) u8 {
-    if (std.math.isNan(v)) return 0;
-    const r = @round(v);
-    if (r < 1) return 1;
-    if (r > 255) return 255;
-    return @intFromFloat(r);
-}
-
-pub fn quantize(enc: Encoding, x: f64) u8 {
-    if (std.math.isNan(x)) return 0;
-    return switch (enc) {
-        .thermo => clampByte(1 + (x + 40) * 2),
-        .percent => clampByte(1 + x * 2.5),
-        .pressure => clampByte(1 + (x - 950) * 2),
-        .wind_speed => clampByte(1 + x * 5),
-        .solar => clampByte(1 + x / 5),
-        .precip_rate => clampByte(1 + 100 * std.math.log10(1 + @max(x, 0))),
-        .code => if (x < 0.5) 0 else clampByte(x),
-        .wind_dir => unreachable, // two-column: quantizeDir
-    };
-}
-
-pub fn quantizeDir(sn: f64, cs: f64) u8 {
-    if (std.math.isNan(sn) or std.math.isNan(cs)) return 0;
-    if (sn == 0 and cs == 0) return 0;
-    var deg = std.math.atan2(sn, cs) * 180.0 / std.math.pi;
-    if (deg < 0) deg += 360;
-    if (deg >= 360) deg -= 360;
-    return clampByte(1 + deg / 1.5);
 }
 
 // -------------------------------------------------------------------- input
@@ -641,7 +577,15 @@ pub const Written = struct { path: []const u8, bytes: usize };
 
 /// Full ingest: parquet -> 13 RAD products + manifests under `{out}/obs/`.
 /// Returns the written .rad paths (caller frees each path and the slice).
-pub fn ingest(alloc: std.mem.Allocator, input: []const u8, out_dir: []const u8, pw: f64) ![]Written {
+///
+/// `gzip` stores bodies gzipped, as radar does in lambda mode: NOT optional
+/// there, because main.zig marks the whole RAD_OUTPUT prefix with
+/// `gdal.markPrefixGzip` and gdal.vsiWrite then stamps
+/// `Content-Encoding: gzip` on every path under it — plain bodies with that
+/// header are unreadable to the client. `window_ms` is the manifest timeline
+/// window (see MANIFEST_WINDOW_MS). The CLI passes `false` and
+/// MANIFEST_WINDOW_MS to keep local runs plain and unwindowed.
+pub fn ingest(alloc: std.mem.Allocator, input: []const u8, out_dir: []const u8, pw: f64, gzip: bool, window_ms: i64) ![]Written {
     const s = stampFromName(std.fs.path.basename(input)) orelse return error.NoTimestampInFilename;
 
     var table = try readTable(alloc, input);
@@ -684,16 +628,23 @@ pub fn ingest(alloc: std.mem.Allocator, input: []const u8, out_dir: []const u8, 
         const rad = try radcore.writeRadV2(alloc, s.ms(), map.grid.geoTran(), @intCast(map.grid.width), @intCast(map.grid.height), 0, band);
         defer alloc.free(rad);
 
-        const dir = try std.fmt.allocPrintSentinel(alloc, "{s}/obs/{s}", .{ base, p.name }, 0);
+        const dir = try std.fmt.allocPrintSentinel(alloc, "{s}/{s}", .{ base, p.id }, 0);
         defer alloc.free(dir);
         _ = c.VSIMkdirRecursive(dir.ptr, 0o755); // exists -> error, harmless
         const path = try std.fmt.allocPrint(alloc, "{s}/{s}.rad", .{ dir, s.slice() });
         errdefer alloc.free(path);
-        try gdal.vsiWrite(alloc, path, rad);
+        const body = if (gzip) try manifest.gzipBytes(alloc, rad) else rad;
+        defer if (gzip) alloc.free(body);
+        try gdal.vsiWrite(alloc, path, body);
 
-        const prefix = try std.fmt.allocPrint(alloc, "/obs/{s}", .{p.name});
+        // `/{p.id}` is the serving path, so out_dir must BE the served root
+        // (the obs lambda points RAD_OUTPUT at the bucket root and lands at
+        // /obs/{variable}/, a sibling of /rads/). Don't "fix" this to
+        // handler.urlPrefix() without changing that contract.
+        const prefix = try std.fmt.allocPrint(alloc, "/{s}", .{p.id});
         defer alloc.free(prefix);
-        try manifest.rebuild(alloc, dir, prefix, p.name, false, MANIFEST_WINDOW_MS);
+        try manifest.rebuild(alloc, dir, prefix, p.key, gzip, window_ms);
+        // .bytes stays the RAW size — the at-rest size is a transport detail.
         try written.append(alloc, .{ .path = path, .bytes = rad.len });
     }
 
@@ -705,7 +656,9 @@ pub fn ingest(alloc: std.mem.Allocator, input: []const u8, out_dir: []const u8, 
         defer alloc.free(flw);
         const path = try std.fmt.allocPrint(alloc, "{s}/obs/wind_average/{s}.flw", .{ base, s.slice() });
         errdefer alloc.free(path);
-        try gdal.vsiWrite(alloc, path, flw);
+        const body = if (gzip) try manifest.gzipBytes(alloc, flw) else flw;
+        defer if (gzip) alloc.free(body);
+        try gdal.vsiWrite(alloc, path, body);
         try written.append(alloc, .{ .path = path, .bytes = flw.len });
     } else |err| {
         log.warn("wind sidecar skipped: {s}", .{@errorName(err)});
@@ -803,48 +756,6 @@ pub fn windSidecar(alloc: std.mem.Allocator, table: *const Table, map: *const In
 // -------------------------------------------------------------------- tests
 
 const testing = std.testing;
-
-test "quantizer table endpoints, clamping, nodata" {
-    const nan = std.math.nan(f64);
-    // thermo: -40 -> 1, 87 -> 255, 20 -> 121, clamp both ends, null -> 0
-    try testing.expectEqual(@as(u8, 1), quantize(.thermo, -40));
-    try testing.expectEqual(@as(u8, 255), quantize(.thermo, 87));
-    try testing.expectEqual(@as(u8, 121), quantize(.thermo, 20));
-    try testing.expectEqual(@as(u8, 1), quantize(.thermo, -60));
-    try testing.expectEqual(@as(u8, 255), quantize(.thermo, 120));
-    try testing.expectEqual(@as(u8, 0), quantize(.thermo, nan));
-    // percent
-    try testing.expectEqual(@as(u8, 1), quantize(.percent, 0));
-    try testing.expectEqual(@as(u8, 251), quantize(.percent, 100));
-    // pressure
-    try testing.expectEqual(@as(u8, 1), quantize(.pressure, 950));
-    try testing.expectEqual(@as(u8, 255), quantize(.pressure, 1077));
-    try testing.expectEqual(@as(u8, 127), quantize(.pressure, 1013));
-    // wind speed
-    try testing.expectEqual(@as(u8, 1), quantize(.wind_speed, 0));
-    try testing.expectEqual(@as(u8, 255), quantize(.wind_speed, 50.8));
-    try testing.expectEqual(@as(u8, 255), quantize(.wind_speed, 99));
-    // solar
-    try testing.expectEqual(@as(u8, 1), quantize(.solar, 0));
-    try testing.expectEqual(@as(u8, 255), quantize(.solar, 1270));
-    // precip rate: log scale
-    try testing.expectEqual(@as(u8, 1), quantize(.precip_rate, 0));
-    try testing.expectEqual(@as(u8, 31), quantize(.precip_rate, 1));
-    try testing.expectEqual(@as(u8, 249), quantize(.precip_rate, 300));
-    try testing.expectEqual(@as(u8, 1), quantize(.precip_rate, -2));
-    // codes: raw; 0 stays absent
-    try testing.expectEqual(@as(u8, 3), quantize(.code, 3));
-    try testing.expectEqual(@as(u8, 15), quantize(.code, 15));
-    try testing.expectEqual(@as(u8, 0), quantize(.code, 0));
-    try testing.expectEqual(@as(u8, 0), quantize(.code, nan));
-    // direction: N=1, E=61, S=121, W=181, calm -> 0
-    try testing.expectEqual(@as(u8, 0), quantizeDir(0, 0));
-    try testing.expectEqual(@as(u8, 1), quantizeDir(0, 1));
-    try testing.expectEqual(@as(u8, 61), quantizeDir(1, 0));
-    try testing.expectEqual(@as(u8, 121), quantizeDir(0, -1));
-    try testing.expectEqual(@as(u8, 181), quantizeDir(-1, 0));
-    try testing.expectEqual(@as(u8, 0), quantizeDir(nan, 1));
-}
 
 test "grid snapping: origin on the pixel lattice, dims cover the bbox" {
     const g = snapGrid(-1000.7, 250.2, 1499.1, 3020.9, 100);
@@ -1167,4 +1078,85 @@ test "parquet read (needs RAD_OBS_SAMPLE + GDAL Parquet driver)" {
     // first row: 86444826fffffff, temperature 36.5, precip_type 1
     try testing.expectEqual(@as(f32, 36.5), t.cols[fieldCol("temperature")][0]);
     try testing.expectEqual(@as(f32, 1), t.cols[fieldCol("precip_type")][0]);
+}
+
+test "ingest: gzip bodies round-trip, window is honoured (needs RAD_OBS_SAMPLE + Parquet driver)" {
+    // Gated like the readTable test above, and deliberately so: this runs the
+    // FULL 551k-cell ingest twice, which is slow in a Debug build. Enable with
+    //   RAD_OBS_SAMPLE=<sample>.parquet zig build test -Doptimize=ReleaseFast
+    const sample = handler.getenv("RAD_OBS_SAMPLE") orelse {
+        log.warn("RAD_OBS_SAMPLE unset; skipping ingest gzip/window test", .{});
+        return;
+    };
+    if (!hasParquetDriver()) {
+        log.warn("GDAL lacks the Parquet driver; skipping ingest gzip/window test", .{});
+        return;
+    }
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // std.Io.Dir has no realpath in 0.16, and testing.tmpDir creates
+    // .zig-cache/tmp/<sub_path> relative to cwd. A relative path is fine here:
+    // gdal.vsiWrite mkdir -p's any non-/vsi path itself.
+    const out = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(out);
+
+    const manifest_path = try std.fmt.allocPrint(alloc, "{s}/obs/temperature/manifest.json", .{out});
+    defer alloc.free(manifest_path);
+
+    // gzip = true is NOT optional in lambda mode: main.zig marks the whole
+    // RAD_OUTPUT prefix via gdal.markPrefixGzip, so gdal.vsiWrite stamps
+    // Content-Encoding: gzip onto every path beneath it. A plain body carrying
+    // that header is undecodable by the client, so assert the bodies really
+    // are gzip-framed AND really inflate back to a valid container.
+    {
+        const written = try ingest(alloc, sample, out, handler.CONUS_PIXEL_SIZE_M, true, MANIFEST_WINDOW_MS);
+        defer {
+            for (written) |w| alloc.free(w.path);
+            alloc.free(written);
+        }
+        try testing.expectEqual(@as(usize, products.len + 1), written.len);
+        for (written) |w| {
+            const raw = (try gdal.vsiRead(alloc, w.path)) orelse return error.MissingOutput;
+            try testing.expect(raw.len > 2 and raw[0] == 0x1f and raw[1] == 0x8b);
+            const body = try manifest.gunzipIfNeeded(alloc, raw); // takes ownership of raw
+            defer alloc.free(body);
+            const magic: []const u8 = if (std.mem.endsWith(u8, w.path, ".flw")) "FLW1" else "RAD2";
+            try testing.expectEqualStrings(magic, body[0..4]);
+            // Written.bytes is the RAW size, not the at-rest size.
+            if (std.mem.endsWith(u8, w.path, ".rad")) try testing.expectEqual(body.len, w.bytes);
+        }
+
+        const raw = (try gdal.vsiRead(alloc, manifest_path)) orelse return error.MissingManifest;
+        try testing.expect(raw.len > 2 and raw[0] == 0x1f and raw[1] == 0x8b);
+        const json = try manifest.gunzipIfNeeded(alloc, raw);
+        defer alloc.free(json);
+        try testing.expect(std.mem.indexOf(u8, json, "20260901-205500.rad") != null);
+        try testing.expect(std.mem.indexOf(u8, json, "\"product\":\"temperature\"") != null);
+        try testing.expect(std.mem.indexOf(u8, json, "\"url\":\"/obs/temperature/") != null);
+    }
+
+    // gzip = false is the CLI path: plain containers, no gzip framing. And a
+    // 1 ms window must drop the frame from the timeline, proving window_ms is
+    // threaded through instead of ignored (frameFresh treats <= 0 as
+    // unwindowed, so 1 is the smallest value that actually windows).
+    {
+        const written = try ingest(alloc, sample, out, handler.CONUS_PIXEL_SIZE_M, false, 1);
+        defer {
+            for (written) |w| alloc.free(w.path);
+            alloc.free(written);
+        }
+        for (written) |w| {
+            const body = (try gdal.vsiRead(alloc, w.path)) orelse return error.MissingOutput;
+            defer alloc.free(body);
+            const magic: []const u8 = if (std.mem.endsWith(u8, w.path, ".flw")) "FLW1" else "RAD2";
+            try testing.expectEqualStrings(magic, body[0..4]);
+        }
+
+        const json = (try gdal.vsiRead(alloc, manifest_path)) orelse return error.MissingManifest;
+        defer alloc.free(json);
+        try testing.expectEqual(@as(u8, '{'), json[0]); // plain, not gzip-framed
+        try testing.expect(std.mem.indexOf(u8, json, "20260901-205500.rad") == null);
+    }
 }

@@ -63,7 +63,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
             std.process.exit(1);
         };
         const out_dir = args_it.next() orelse (std.fs.path.dirname(parquet) orelse ".");
-        const written = try obs.ingest(alloc, parquet, out_dir, handler.resolution());
+        // CLI: plain bodies, unwindowed manifests — the lambda path passes
+        // handler.gzip_output and handler.manifestWindowMs() instead.
+        const written = try obs.ingest(alloc, parquet, out_dir, handler.resolution(), false, obs.MANIFEST_WINDOW_MS);
         defer {
             for (written) |w| alloc.free(w.path);
             alloc.free(written);

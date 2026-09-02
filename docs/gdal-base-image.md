@@ -139,7 +139,7 @@ test/e2e_local.sh rad-lambda:local  # MinIO + RIE, full runtime loop
 
 Status: all four pass. Parity is byte-identical over 4 CONUS frames; e2e covers
 process + off-grid skip + gzip metadata + manifest + internal byte parity; the
-obs/parquet path produces 14 products plus a wind `.flw` sidecar.
+obs/parquet path produces 13 products plus a wind `.flw` sidecar.
 
 Cold start still needs measuring on real infrastructure — Lambda lazily loads
 image blocks, so the improvement is not linear in image size. Capture a

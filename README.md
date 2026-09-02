@@ -20,7 +20,11 @@ via VSI (local path or `/vsis3/bucket/prefix`).
 - **Lambda**: when `AWS_LAMBDA_RUNTIME_API` is set (containers on AWS set it),
   runs the custom-runtime loop. Accepts SQS-wrapped SNS S3 notifications (the
   production chain: NOAA SNS -> our SQS -> event-source mapping), direct
-  SNS->Lambda, or raw S3 events. Per record: skips stamps off the 10-minute
+  SNS->Lambda, or raw S3 events. Each record is routed by key extension
+  (`handler.kindForKey`): grib2 to the radar path below, `.parquet` to the obs
+  ingest. A key that matches neither, or whose name carries no timestamp, is
+  counted in `skipped` rather than failing the batch into the DLQ.
+  Per radar record: skips stamps off the 10-minute
   grid (MRMS publishes every 2 min), derives the region id prefix from the
   key's first segment (CONUS unprefixed, `ALASKA/` -> `alaska_`, ...), writes
   the RAD, then rebuilds `manifest.json` from a listing of the output dir
@@ -36,8 +40,19 @@ via VSI (local path or `/vsis3/bucket/prefix`).
   and `RAD_MANIFEST_HOURS` (default 3, 0 = unwindowed): the manifest lists
   only frames stamped within the window; older RADs stay in the bucket,
   fetchable by URL, until lifecycle expiry.
-- **CLI**: `rad_lambda <grib(.gz) | dir> [out_dir]` for local testing
-  (plain files, no gzip, no manifest).
+- **Obs** (same binary, its OWN lambda function): a `.parquet` key runs the H3
+  observation ingest — 13 products under `{RAD_OUTPUT}/obs/{variable}/` plus a
+  wind `.flw` sidecar and a manifest per variable. Point that function's
+  `RAD_OUTPUT` at the **bucket root** (`/vsis3/my-bucket`), so obs lands at
+  `/obs/{variable}/` as a sibling of `/rads/` and the serving path matches the
+  manifest URLs obs writes. No 10-minute grid gate (issuances are off the
+  lattice) and no region prefix (H3 is global). Extra config:
+  `RAD_OBS_SMOOTH` (kernel scale in cell half-widths, default 1.0; 0 disables
+  and reproduces the unsmoothed plateaus byte-for-byte). Separate functions
+  keep the two products' memory, timeout, concurrency and DLQ independent.
+- **CLI**: `rad_lambda <grib(.gz) | dir> [out_dir]`, or
+  `rad_lambda --obs <file.parquet> [out_dir]`, for local testing (plain files,
+  no gzip, unwindowed manifests).
 
 ## Dev
 

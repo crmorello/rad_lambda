@@ -195,12 +195,23 @@ COPY --from=build /opt/gdal/share /opt/gdal/share
 # lookup at gdal.zig:76 fails at runtime.
 # GDAL_DRIVER_PATH is safe to set because Parquet is a deferred plugin — the
 # directory is scanned but nothing is dlopen'd until a file matches.
+#
+# GDAL_DISABLE_READDIR_ON_OPEN is load-bearing, not a tuning knob. By default
+# GDAL lists the parent prefix when opening a /vsis3 object, and vsicurl caches
+# that listing for the life of the process — so on a WARM lambda container any
+# object that arrived after the first open is invisible and the open fails.
+# Reproduced: two obs parquets 5 minutes apart in one container, the second
+# returned {"errorMessage":"OpenFailed"}; with this set, it succeeds. It is the
+# same trap gdal.zig:49-56 documents for radar, which pays for it with a
+# 6-attempt retry + full VSICurlClearCache. EMPTY_DIR skips the listing and
+# goes straight to the object, which also drops one S3 LIST per open.
 ENV GDAL_DATA=/opt/gdal/share/gdal \
     PROJ_DATA=/opt/gdal/share/proj \
     PROJ_NETWORK=OFF \
     GDAL_DRIVER_PATH=/opt/gdal/lib/gdalplugins \
     LD_LIBRARY_PATH=/opt/gdal/lib \
     GDAL_PAM_ENABLED=NO \
+    GDAL_DISABLE_READDIR_ON_OPEN=EMPTY_DIR \
     CPL_TMPDIR=/tmp \
     GDAL_CACHEMAX=256
 

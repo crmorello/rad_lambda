@@ -46,27 +46,33 @@ echo "candidate: $NEW_IMAGE"
 echo
 
 rc=0
+i=0
 for g in "${GRIBS[@]}"; do
   name=$(basename "$g")
-  mkdir -p "$WORK/ref" "$WORK/new"
-  run_cli "$REF_IMAGE" "$WORK/ref" "$g" || fail "reference image failed on $name"
-  run_cli "$NEW_IMAGE" "$WORK/new" "$g" || fail "candidate image failed on $name"
+  i=$((i + 1))
+  # A UNIQUE dir per frame, never deleted and recreated at the same path:
+  # on macOS a recreated directory can leave the docker bind mount attached to
+  # the stale inode, which shows up as a spurious "image failed" on frame 2+.
+  # The EXIT trap removes $WORK wholesale, so nothing needs cleaning here.
+  refd="$WORK/ref-$i"; newd="$WORK/new-$i"
+  mkdir -p "$refd" "$newd"
+  run_cli "$REF_IMAGE" "$refd" "$g" || fail "reference image failed on $name"
+  run_cli "$NEW_IMAGE" "$newd" "$g" || fail "candidate image failed on $name"
 
-  for f in "$WORK/ref"/*.rad; do
+  for f in "$refd"/*.rad; do
     b=$(basename "$f")
-    if [ ! -f "$WORK/new/$b" ]; then
+    if [ ! -f "$newd/$b" ]; then
       echo "  MISSING  $b"; rc=1; continue
     fi
-    if cmp -s "$f" "$WORK/new/$b"; then
+    if cmp -s "$f" "$newd/$b"; then
       echo "  ok       $b  ($(wc -c < "$f") bytes)"
     else
       echo "  DIFFER   $b"
-      echo "           ref $(shasum -a 256 < "$f" | cut -c1-16)  new $(shasum -a 256 < "$WORK/new/$b" | cut -c1-16)"
-      cmp "$f" "$WORK/new/$b" | head -3 | sed 's/^/           /'
+      echo "           ref $(shasum -a 256 < "$f" | cut -c1-16)  new $(shasum -a 256 < "$newd/$b" | cut -c1-16)"
+      cmp "$f" "$newd/$b" | head -3 | sed 's/^/           /'
       rc=1
     fi
   done
-  rm -rf "$WORK/ref" "$WORK/new"
 done
 
 echo

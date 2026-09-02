@@ -1,11 +1,17 @@
 //! Event handling: env config, per-file processing (warp -> RAD v2 via
 //! radcore -> optional gzip -> VSI write), S3/SNS/SQS event unwrapping,
 //! region prefixes, 10-minute slice grid. Port of the Crystal handler.
+//!
+//! Records are routed per product by key extension (`kindForKey`): MRMS grib2
+//! to the radar path, `.parquet` to the obs ingest. The two products run as
+//! separate lambda functions off the same image, so routing here is what lets
+//! one binary serve both.
 const std = @import("std");
 const radcore = @import("radcore");
 const gdal = @import("gdal.zig");
 const stamp = @import("stamp.zig");
 const manifest = @import("manifest.zig");
+const obs = @import("obs.zig");
 
 /// Pixel density of the prod CONUS precip output (6373x4161 over the CONUS
 /// mercator extent). Every region is warped to this so all RADs share one
@@ -18,6 +24,8 @@ pub var gzip_output = false;
 /// Precompute .flw flow sidecars at ingest (RAD_FLOW=0 opts out). Spec:
 /// radcore/docs/flw-format.md — the flow ending at frame X.rad is X.flw.
 pub var flow_enabled = true;
+/// Flow estimate LOD for the .flw sidecar (see flowSidecar).
+pub const FLOW_LOD: u32 = 2;
 
 /// The pipeline's slice cadence: frames land on 10-minute boundaries, so the
 /// previous frame of a pair is exactly one slice back.
@@ -110,7 +118,7 @@ pub fn processFile(alloc: std.mem.Allocator, input: []const u8, out_dir: []const
 /// Write "{prefix}{stamp}.flw" for the pair (stamp - 10 min) -> stamp: read
 /// the previous slice's RAD back from the output dir, estimate flow via
 /// radcore, encode per spec (confidence plane on, vec_scale 2 m/count,
-/// lod 1). Missing previous frame = gap = write nothing; a 404 on the
+/// lod FLOW_LOD). Missing previous frame = gap = write nothing; a 404 on the
 /// sidecar is the client's dissolve signal.
 fn flowSidecar(alloc: std.mem.Allocator, out_dir: []const u8, id_prefix: []const u8, s: stamp.Stamp, next_rad: []const u8) !void {
     const prev_s = stamp.fromMs(s.ms() - SLICE_INTERVAL_MS) orelse return;
@@ -152,13 +160,17 @@ fn flowSidecar(alloc: std.mem.Allocator, out_dir: []const u8, id_prefix: []const
     const ph = radcore.store.parseRadHeader(prev_rad) orelse return error.BadPreviousRad;
     const nh = radcore.store.parseRadHeader(next_rad) orelse return error.BadNextRad;
 
+    // lod 2, like the client's own estimate: the ±8-texel search window is a
+    // speed ceiling (16.3 m/s at lod 1 over a 10-min gap — measured: every
+    // echo above it went unmatched and diffusion-filled, mean speeds ~30 %
+    // low). lod 2 doubles the ceiling to 32.6 m/s at a 78 km node grid.
     const flw = try radcore.flow_file.flowFileForPair(
         alloc,
         recOf(prev_rad, ph),
         ph.time,
         recOf(next_rad, nh),
         nh.time,
-        1,
+        FLOW_LOD,
         radcore.flow_file.DEFAULT_VEC_SCALE,
     );
     defer alloc.free(flw);
@@ -243,8 +255,43 @@ fn collectS3Records(arena: std.mem.Allocator, event: std.json.Value, out: *std.A
     }
 }
 
-/// Trigger event -> RAD per on-grid record + manifest rebuild. Returns the
-/// JSON response body. All allocation on `arena` (freed per invocation).
+/// Which producer a key routes to. Deliberately keyed on the EXTENSION and not
+/// on the bucket: the bucket arrives in the S3 event, and the obs source is a
+/// third-party bucket behind CloudFront, so hard-coding it here would just be
+/// deploy config leaking into the binary.
+pub const InputKind = enum { radar, obs };
+
+pub fn kindForKey(key: []const u8) ?InputKind {
+    // Same extension set main.zig walks in CLI directory mode.
+    if (std.mem.endsWith(u8, key, ".grib2") or
+        std.mem.endsWith(u8, key, ".grb2") or
+        std.mem.endsWith(u8, key, ".grib2.gz")) return .radar;
+    if (std.mem.endsWith(u8, key, ".parquet")) return .obs;
+    return null;
+}
+
+/// obs.ingest on the C allocator, NOT the invocation arena. ingest allocates a
+/// ~16 MB band plus a ~13 MB RAD per product and frees each before the next,
+/// but ArenaAllocator.free is a no-op (it can only shrink the most recent
+/// allocation), so on the arena those 13 rounds would pile up to ~500 MB
+/// instead of being reused. Radar never exposed this: it allocates one band per
+/// record. Paths are copied onto the arena for the response and the originals
+/// released here.
+fn ingestObs(arena: std.mem.Allocator, input: []const u8) ![][]const u8 {
+    const alloc = std.heap.c_allocator;
+    const written = try obs.ingest(alloc, input, try outputDir(), resolution(), gzip_output, manifestWindowMs());
+    defer {
+        for (written) |w| alloc.free(w.path);
+        alloc.free(written);
+    }
+    const paths = try arena.alloc([]const u8, written.len);
+    for (written, 0..) |w, i| paths[i] = try arena.dupe(u8, w.path);
+    return paths;
+}
+
+/// Trigger event -> RAD per routed record + manifest rebuild. Returns the
+/// JSON response body. All allocation on `arena` (freed per invocation),
+/// except obs.ingest — see ingestObs.
 pub fn handleEvent(arena: std.mem.Allocator, event_json: []const u8) ![]const u8 {
     const event = try std.json.parseFromSliceLeaky(std.json.Value, arena, event_json, .{});
 
@@ -253,22 +300,59 @@ pub fn handleEvent(arena: std.mem.Allocator, event_json: []const u8) ![]const u8
 
     var outputs: std.ArrayList([]const u8) = .empty;
     var skipped: usize = 0;
+    var radar_written = false;
     for (records.items) |record| {
         const s3 = record.object.get("s3").?.object;
         const bucket = s3.get("bucket").?.object.get("name").?.string;
         const key = try decodeKey(arena, s3.get("object").?.object.get("key").?.string);
+        const name = std.fs.path.basename(key);
 
-        const s = stamp.fromFilename(std.fs.path.basename(key)) orelse return error.NoTimestampInFilename;
-        if (!s.onSliceGrid()) {
+        // An unroutable key is SKIPPED, never an error. Failing the record
+        // fails the whole SQS batch and eventually DLQs it, and one stray
+        // object in a watched prefix should not do that. A real upstream
+        // rename still surfaces: nothing gets written, so the freshness alarm
+        // (deploy/05-alarms.sh) fires on its own.
+        const kind = kindForKey(key) orelse {
+            std.log.warn("skipping {s}: no producer for this key", .{key});
             skipped += 1;
             continue;
-        }
+        };
         const input = try std.fmt.allocPrint(arena, "/vsis3/{s}/{s}", .{ bucket, key });
-        const prefix = try regionPrefix(arena, key);
-        try outputs.append(arena, try processFile(arena, input, try outputDir(), resolution(), prefix));
+
+        switch (kind) {
+            .radar => {
+                const s = stamp.fromFilename(name) orelse {
+                    std.log.warn("skipping {s}: no timestamp in filename", .{key});
+                    skipped += 1;
+                    continue;
+                };
+                if (!s.onSliceGrid()) {
+                    skipped += 1;
+                    continue;
+                }
+                const prefix = try regionPrefix(arena, key);
+                try outputs.append(arena, try processFile(arena, input, try outputDir(), resolution(), prefix));
+                radar_written = true;
+            },
+            // No slice-grid gate (obs issuances sit off the 10-minute lattice
+            // — the epoch sample is 20:55:00) and no region prefix (H3 is
+            // global; obs namespaces by variable directory instead). ingest
+            // writes its own 13 per-variable manifests.
+            .obs => {
+                if (obs.stampFromName(name) == null) {
+                    std.log.warn("skipping {s}: no timestamp in filename", .{key});
+                    skipped += 1;
+                    continue;
+                }
+                for (try ingestObs(arena, input)) |path| try outputs.append(arena, path);
+            },
+        }
     }
 
-    if (outputs.items.len > 0) {
+    // Gated on radar records, NOT on outputs.len: an obs-only invocation would
+    // otherwise rebuild a "reflectivity" manifest by listing RAD_OUTPUT, which
+    // for the obs function is the bucket root.
+    if (radar_written) {
         const prefix = try urlPrefix(arena);
         try manifest.rebuild(arena, try outputDir(), prefix, "reflectivity", gzip_output, manifestWindowMs());
     }
@@ -315,4 +399,43 @@ test "s3 record unwrapping: raw, SNS, SQS-wrapped-SNS" {
     var sqs_records: std.ArrayList(std.json.Value) = .empty;
     try collectS3Records(arena, sqs_event, &sqs_records);
     try std.testing.expectEqual(@as(usize, 1), sqs_records.items.len);
+}
+
+test "kindForKey: routing by extension" {
+    try std.testing.expectEqual(InputKind.radar, kindForKey("CONUS/MRMS_SeamlessHSR_00.00_20260712-005000.grib2.gz").?);
+    try std.testing.expectEqual(InputKind.radar, kindForKey("a/b_20260712-005000.grib2").?);
+    try std.testing.expectEqual(InputKind.radar, kindForKey("a/b_20260712-005000.grb2").?);
+    try std.testing.expectEqual(InputKind.obs, kindForKey("gcc/output/1788296100_slim.parquet").?);
+    // Anything we have no producer for routes nowhere (and is skipped, not an error).
+    try std.testing.expect(kindForKey("gcc/output/_SUCCESS") == null);
+    try std.testing.expect(kindForKey("gcc/output/README.txt") == null);
+    try std.testing.expect(kindForKey("no-extension") == null);
+    try std.testing.expect(kindForKey("") == null);
+}
+
+test "handleEvent: unroutable and stampless keys skip instead of failing the batch" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // None of these reach outputDir(), so no RAD_OUTPUT is needed here.
+    const cases = [_][]const u8{
+        // No producer for the key: a stray object in a watched prefix.
+        \\{"Records":[{"s3":{"bucket":{"name":"b"},"object":{"key":"gcc/output/_SUCCESS"}}}]}
+        ,
+        // Grib with no stamp: used to return error.NoTimestampInFilename and
+        // fail the whole SQS batch into the DLQ.
+        \\{"Records":[{"s3":{"bucket":{"name":"b"},"object":{"key":"CONUS/latest.grib2.gz"}}}]}
+        ,
+        // Parquet with no stamp: obs.stampFromName wants a 10-digit epoch or
+        // an embedded YYYYMMDD-HHMMSS.
+        \\{"Records":[{"s3":{"bucket":{"name":"b"},"object":{"key":"gcc/output/slim.parquet"}}}]}
+        ,
+    };
+    for (cases) |event| {
+        try std.testing.expectEqualStrings(
+            "{\"processed\":[],\"skipped\":1}",
+            try handleEvent(arena, event),
+        );
+    }
 }
