@@ -696,7 +696,108 @@ pub fn ingest(alloc: std.mem.Allocator, input: []const u8, out_dir: []const u8, 
         try manifest.rebuild(alloc, dir, prefix, p.name, false, MANIFEST_WINDOW_MS);
         try written.append(alloc, .{ .path = path, .bytes = rad.len });
     }
+
+    // Wind vector field as a FLW sidecar beside the wind_average product:
+    // the client already fetches <id>.flw for every frame and composes it
+    // onto the domain grid (zc_store_flow_sidecars), so particles get a
+    // vector texture with no new product type. Best-effort, like radar's.
+    if (windSidecar(alloc, &table, &map, s.ms())) |flw| {
+        defer alloc.free(flw);
+        const path = try std.fmt.allocPrint(alloc, "{s}/obs/wind_average/{s}.flw", .{ base, s.slice() });
+        errdefer alloc.free(path);
+        try gdal.vsiWrite(alloc, path, flw);
+        try written.append(alloc, .{ .path = path, .bytes = flw.len });
+    } else |err| {
+        log.warn("wind sidecar skipped: {s}", .{@errorName(err)});
+    }
     return written.toOwnedSlice(alloc);
+}
+
+// ------------------------------------------------------------- wind sidecar
+
+/// Meteorological convention: direction is where the wind blows FROM, so the
+/// flow (to) vector is the negated unit vector. Flip if a source turns out
+/// to report the "to" direction.
+pub const WIND_FROM = true;
+/// FLW node spacing in full-res texels — the composer's contract (TREC BLOCK).
+pub const WIND_NODE_PX: usize = 32;
+/// Displacement interval: one radar slice, so a FLW unit is "10 minutes of
+/// travel" and the client's texel-per-interval math matches radar flow.
+pub const WIND_INTERVAL_MS: i64 = 10 * 60 * 1000;
+
+pub const WindField = struct { vectors: []f32, gw: u32, gh: u32 };
+
+/// Block-mean wind vectors on the FLW node grid, in meters of travel over
+/// WIND_INTERVAL_MS: dx east-positive, dy SOUTH-positive (the FLW geo has a
+/// negative pixel height, docs/flw-format.md). Weight = pixel owned AND
+/// speed, sin, cos all non-null; empty nodes are (0, 0).
+pub fn windVectors(alloc: std.mem.Allocator, table: *const Table, map: *const IndexMap) !WindField {
+    const w: usize = map.grid.width;
+    const h: usize = map.grid.height;
+    const gw = (w + WIND_NODE_PX - 1) / WIND_NODE_PX;
+    const gh = (h + WIND_NODE_PX - 1) / WIND_NODE_PX;
+    const sum = try alloc.alloc(f64, gw * gh * 2);
+    defer alloc.free(sum);
+    @memset(sum, 0);
+    const cnt = try alloc.alloc(u32, gw * gh);
+    defer alloc.free(cnt);
+    @memset(cnt, 0);
+
+    const spd = table.cols[fieldCol("wind_average")];
+    const sn = table.cols[fieldCol("wind_dir_sin")];
+    const cs = table.cols[fieldCol("wind_dir_cos")];
+    const sign: f64 = if (WIND_FROM) -1 else 1;
+    const secs: f64 = @as(f64, @floatFromInt(WIND_INTERVAL_MS)) / 1000.0;
+
+    for (0..h) |y| {
+        const ny = y / WIND_NODE_PX;
+        for (0..w) |x| {
+            const ci = map.cell[y * w + x];
+            if (ci == NONE) continue;
+            const v = spd[ci];
+            const a = sn[ci];
+            const b = cs[ci];
+            if (std.math.isNan(v) or std.math.isNan(a) or std.math.isNan(b)) continue;
+            const n = ny * gw + x / WIND_NODE_PX;
+            sum[n * 2 + 0] += sign * v * a; // east
+            sum[n * 2 + 1] += sign * v * b; // north
+            cnt[n] += 1;
+        }
+    }
+    const out = try alloc.alloc(f32, gw * gh * 2);
+    for (0..gw * gh) |n| {
+        if (cnt[n] == 0) {
+            out[n * 2] = 0;
+            out[n * 2 + 1] = 0;
+            continue;
+        }
+        const k = 1.0 / @as(f64, @floatFromInt(cnt[n]));
+        out[n * 2 + 0] = @floatCast(sum[n * 2 + 0] * k * secs); // meters east
+        out[n * 2 + 1] = @floatCast(-sum[n * 2 + 1] * k * secs); // meters, south-positive
+    }
+    return .{ .vectors = out, .gw = @intCast(gw), .gh = @intCast(gh) };
+}
+
+/// Encode the wind field as a FLW file for the frame at `time_ms`
+/// (pair = [time − interval, time]); geo origin at the CENTER of node (0,0),
+/// exactly as radcore's flowFileForPair builds it.
+pub fn windSidecar(alloc: std.mem.Allocator, table: *const Table, map: *const IndexMap, time_ms: i64) ![]u8 {
+    const field = try windVectors(alloc, table, map);
+    defer alloc.free(field.vectors);
+    const s = @as(f64, @floatFromInt(WIND_NODE_PX)) * map.grid.pw;
+    const geo = [6]f64{
+        map.grid.origin_x + s / 2, s, 0,
+        map.grid.origin_y - s / 2, 0, -s,
+    };
+    var vmax: f32 = 0;
+    for (0..@as(usize, field.gw) * field.gh) |n| {
+        const m = @sqrt(field.vectors[n * 2] * field.vectors[n * 2] + field.vectors[n * 2 + 1] * field.vectors[n * 2 + 1]);
+        vmax = @max(vmax, m);
+    }
+    log.info("wind sidecar: {d}x{d} nodes @ {d} px, max {d:.1} m/s", .{
+        field.gw, field.gh, WIND_NODE_PX, vmax / (@as(f32, @floatFromInt(WIND_INTERVAL_MS)) / 1000.0),
+    });
+    return radcore.flow_file.encodeFlw(alloc, field.vectors, null, geo, time_ms - WIND_INTERVAL_MS, time_ms, field.gw, field.gh, @intCast(WIND_NODE_PX), radcore.flow_file.DEFAULT_VEC_SCALE);
 }
 
 // -------------------------------------------------------------------- tests
@@ -992,6 +1093,50 @@ test "bandFor: categorical bypasses smoothing; wind_dir averages sin/cos" {
     // sin/cos blend across the boundary -> intermediate (north-easterly) byte
     const mid = dir[W + W / 2];
     try testing.expect(mid > 1 and mid < 61);
+}
+
+test "wind sidecar: uniform 10 m/s north wind -> (0, +6000 m) per node, empty nodes zero, parses" {
+    const W = 70; // 3 node columns (32, 32, 6), 1 node row
+    const H = 20;
+    var t: Table = undefined;
+    const cells = [_]h3.H3Index{1};
+    const res = [_]u8{6};
+    t.cells = @constCast(&cells);
+    t.res = @constCast(&res);
+    var colbuf: [field_names.len][1]f32 = undefined;
+    for (&colbuf) |*cb| cb.* = .{0};
+    colbuf[fieldCol("wind_average")] = .{10};
+    colbuf[fieldCol("wind_dir_sin")] = .{0}; // FROM north: sin 0, cos 1
+    colbuf[fieldCol("wind_dir_cos")] = .{1};
+    for (&t.cols, &colbuf) |*c_, *cb| c_.* = cb;
+    var cell: [W * H]u32 = @splat(NONE);
+    var rp: [W * H]u8 = @splat(NO_RES);
+    for (0..H) |y| for (0..64) |x| { // leave the third node column empty
+        cell[y * W + x] = 0;
+        rp[y * W + x] = 6;
+    };
+    const map = IndexMap{ .grid = .{ .origin_x = 1000, .origin_y = 5000, .pw = 100, .width = W, .height = H }, .cell = &cell, .res = &rp };
+
+    const f = try windVectors(testing.allocator, &t, &map);
+    defer testing.allocator.free(f.vectors);
+    try testing.expectEqual(@as(u32, 3), f.gw);
+    try testing.expectEqual(@as(u32, 1), f.gh);
+    // from-north wind blows south: east 0, south +10 m/s * 600 s
+    try testing.expectApproxEqAbs(@as(f32, 0), f.vectors[0], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 6000), f.vectors[1], 1e-2);
+    try testing.expectApproxEqAbs(@as(f32, 6000), f.vectors[3], 1e-2);
+    try testing.expectEqual(@as(f32, 0), f.vectors[4]);
+    try testing.expectEqual(@as(f32, 0), f.vectors[5]);
+
+    const flw = try windSidecar(testing.allocator, &t, &map, 1_788_296_100_000);
+    defer testing.allocator.free(flw);
+    const parsed = radcore.flow_file.parseFlw(flw) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 3), parsed.grid_w);
+    try testing.expectEqual(@as(i64, 1_788_296_100_000 - WIND_INTERVAL_MS), parsed.prev_time_ms);
+    // geo origin = center of node (0,0): 1000 + 3200/2, 5000 - 3200/2
+    try testing.expectApproxEqAbs(@as(f64, 2600), parsed.geo[0], 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 3400), parsed.geo[3], 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, -3200), parsed.geo[5], 1e-9);
 }
 
 test "stamp from epoch filename" {

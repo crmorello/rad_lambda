@@ -69,7 +69,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             alloc.free(written);
         }
         for (written) |w| printOut("{s} ({d} bytes)\n", .{ w.path, w.bytes });
-        printOut("Wrote {d} obs product(s) under {s}/obs\n", .{ written.len, std.mem.trimEnd(u8, out_dir, "/") });
+        printOut("Wrote {d} obs file(s) under {s}/obs\n", .{ written.len, std.mem.trimEnd(u8, out_dir, "/") });
         return;
     }
 
