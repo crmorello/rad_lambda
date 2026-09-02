@@ -1,7 +1,3 @@
-/lib/
-/bin/
-/.shards.info
-shard.override.yml
-*.dwarf
+test/.cache/
 zig/.zig-cache/
 zig/zig-out/

@@ -5,9 +5,9 @@ S3-triggered lambda: MRMS precip grib2(.gz) in, RAD file out.
 **Implementation: Zig (`zig/`), sharing radcore with raydare** (§14 one
 language, all layers): the RAD v2 encoder lives in
 `raydare/radcore/src/core.zig` next to the decoder the client renders from —
-one implementation of the format, parity-pinned. The original Crystal build
-(`src/`, `shard.yml`) is kept as the parity reference; the Zig CLI's RAD
-output is byte-identical to it (golden-tested per region).
+one implementation of the format, parity-pinned. (The original Crystal build
+was removed once the Zig output was verified byte-identical to it, golden-tested
+per region; see git history before Sep 2026 if the reference is ever needed.)
 
 Pipeline (all in-process, no temp files): open via GDAL VSI
 (`/vsigzip/`, `/vsis3/`) → `GDALWarp` to EPSG:3857 at a fixed pixel density
@@ -37,9 +37,9 @@ via VSI (local path or `/vsis3/bucket/prefix`).
   only frames stamped within the window; older RADs stay in the bucket,
   fetchable by URL, until lifecycle expiry.
 - **CLI**: `rad_lambda <grib(.gz) | dir> [out_dir]` for local testing
-  (plain files, no gzip, no manifest — parity with the Crystal CLI).
+  (plain files, no gzip, no manifest).
 
-## Dev (Zig — the workflow)
+## Dev
 
     cd zig
     zig build test
@@ -51,12 +51,7 @@ extract radcore to its own repo to durably break that coupling. GDAL comes
 from homebrew by default; override with `-Dgdal-include=... -Dgdal-lib=...`.
 
 Docker image (the deployable): see `Dockerfile` — needs
-`--build-context raydare=...` for radcore.
-
-## Crystal parity reference
-
-    shards install   # uses shard.override.yml -> ../lib_gdal until pushed
-    shards build     # bin/rad_lambda, byte-identical CLI output
+`--build-context radcore=...` for radcore.
 
 Base-only RADs for now — mixed-phase typing (temp/dew masks) is the known
 next step and changes this to a multi-input handler (port it into radcore

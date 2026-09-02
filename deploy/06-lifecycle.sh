@@ -1,6 +1,6 @@
 #!/bin/bash
 # Bucket retention: expire .rad/.flw objects after 1 day (S3 lifecycle
-# granularity is days). The manifest window (manifest.cr WINDOW) bounds what
+# granularity is days). The manifest window (RAD_MANIFEST_HOURS, manifest.zig) bounds what
 # clients SEE; this bounds what we STORE. Idempotent — safe to re-run.
 set -euo pipefail
 cd "$(dirname "$0")" && source ./00-config.sh

@@ -1,7 +1,0 @@
-# NOTICE: This lockfile contains some overrides from shard.override.yml
-version: 2.0
-shards:
-  lib_gdal: # Overridden
-    path: ../lib_gdal
-    version: 0.1.0
-
