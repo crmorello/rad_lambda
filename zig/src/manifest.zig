@@ -23,16 +23,17 @@ fn frameLessThan(_: void, a: Frame, b: Frame) bool {
 }
 
 /// Manifest JSON for a set of frames. `url_prefix` is the serving path of
-/// the output dir ("" or "/rads" — no trailing slash). `bytes` is the stored
-/// object size (gzipped when gzip-at-rest is on) — i.e. transfer size.
-pub fn build(alloc: std.mem.Allocator, frames: []Frame, url_prefix: []const u8) ![]u8 {
+/// the output dir ("" or "/rads" — no trailing slash); `product` names the
+/// field ("reflectivity", or an obs variable). `bytes` is the stored object
+/// size (gzipped when gzip-at-rest is on) — i.e. transfer size.
+pub fn build(alloc: std.mem.Allocator, frames: []Frame, url_prefix: []const u8, product: []const u8) ![]u8 {
     std.mem.sort(Frame, frames, {}, frameLessThan);
 
     var aw: std.Io.Writer.Allocating = .init(alloc);
     errdefer aw.deinit();
     const w = &aw.writer;
 
-    try w.writeAll("{\"product\":\"reflectivity\",\"updated_at\":\"");
+    try w.print("{{\"product\":\"{s}\",\"updated_at\":\"", .{product});
     if (frames.len > 0) {
         var last: stamp.Stamp = undefined;
         @memcpy(&last.text, stamp.stampOfId(frames[frames.len - 1].id)[0..15]);
@@ -64,7 +65,7 @@ pub fn frameFresh(id: []const u8, now_ms: i64, window_ms: i64) bool {
 /// Only frames whose STAMP falls inside `window_ms` (ending now) are listed —
 /// older RADs stay in the bucket (fetchable by URL until lifecycle expiry),
 /// they just leave the timeline the client sees.
-pub fn rebuild(alloc: std.mem.Allocator, out_dir: []const u8, url_prefix: []const u8, gzip: bool, window_ms: i64) !void {
+pub fn rebuild(alloc: std.mem.Allocator, out_dir: []const u8, url_prefix: []const u8, product: []const u8, gzip: bool, window_ms: i64) !void {
     const dir = std.mem.trimEnd(u8, out_dir, "/");
     // vsicurl caches directory listings per process; a warm container would
     // otherwise rebuild from the frame set it saw at first listing, forever.
@@ -86,7 +87,7 @@ pub fn rebuild(alloc: std.mem.Allocator, out_dir: []const u8, url_prefix: []cons
         try frames.append(alloc, .{ .id = id, .bytes = entry.size });
     }
 
-    const json = try build(alloc, frames.items, url_prefix);
+    const json = try build(alloc, frames.items, url_prefix, product);
     defer alloc.free(json);
     const body = if (gzip) try gzipBytes(alloc, json) else json;
     defer if (gzip) alloc.free(body);
@@ -152,7 +153,7 @@ test "manifest json shape (crystal-derived, plus real byte sizes)" {
         .{ .id = "20260714-175000", .bytes = 718848 },
         .{ .id = "20260714-174000", .bytes = 704166 },
     };
-    const json = try build(alloc, &frames, "/rads");
+    const json = try build(alloc, &frames, "/rads", "reflectivity");
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
         "{\"product\":\"reflectivity\",\"updated_at\":\"2026-07-14T17:50:00Z\",\"frames\":[" ++
@@ -162,7 +163,7 @@ test "manifest json shape (crystal-derived, plus real byte sizes)" {
         json,
     );
 
-    const empty = try build(alloc, &.{}, "");
+    const empty = try build(alloc, &.{}, "", "reflectivity");
     defer alloc.free(empty);
     try std.testing.expectEqualStrings("{\"product\":\"reflectivity\",\"updated_at\":\"\",\"frames\":[]}", empty);
 }

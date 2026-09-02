@@ -118,7 +118,21 @@ fn flowSidecar(alloc: std.mem.Allocator, out_dir: []const u8, id_prefix: []const
         std.mem.trimEnd(u8, out_dir, "/"), id_prefix, prev_s.slice(),
     });
     defer alloc.free(prev_path);
-    const prev_raw = (try gdal.vsiRead(alloc, prev_path)) orelse return; // gap: no sidecar
+    // Warm containers cache vsicurl directory listings AND misses — a
+    // listing taken before the previous frame existed makes this read fail
+    // without a network request (the exact trap clearVsiCache documents).
+    gdal.clearVsiCache(alloc, prev_path);
+    const prev_raw = (try gdal.vsiRead(alloc, prev_path)) orelse {
+        // Gap policy: no previous frame -> no sidecar. Logged with GDAL's
+        // last error so a genuine gap (silent 404) and an access/transport
+        // failure are distinguishable in CloudWatch.
+        const gerr = std.mem.span(gdal.c.CPLGetLastErrorMsg());
+        std.log.info("flow sidecar {s}{s}.flw: skipped (no previous frame at {s}{s}{s})", .{
+            id_prefix,                            s.slice(), prev_path,
+            if (gerr.len > 0) "; gdal: " else "", gerr,
+        });
+        return;
+    };
     const prev_rad = try manifest.gunzipIfNeeded(alloc, prev_raw); // owns prev_raw
     defer alloc.free(prev_rad);
 
@@ -155,6 +169,9 @@ fn flowSidecar(alloc: std.mem.Allocator, out_dir: []const u8, id_prefix: []const
     });
     defer alloc.free(flw_path);
     try gdal.vsiWrite(alloc, flw_path, flw_body);
+    std.log.info("flow sidecar {s}{s}.flw: {d} B raw, {d} B at rest", .{
+        id_prefix, s.slice(), flw.len, flw_body.len,
+    });
 }
 
 /// application/x-www-form-urlencoded decode (S3 event keys): '+' -> space,
@@ -253,7 +270,7 @@ pub fn handleEvent(arena: std.mem.Allocator, event_json: []const u8) ![]const u8
 
     if (outputs.items.len > 0) {
         const prefix = try urlPrefix(arena);
-        try manifest.rebuild(arena, try outputDir(), prefix, gzip_output, manifestWindowMs());
+        try manifest.rebuild(arena, try outputDir(), prefix, "reflectivity", gzip_output, manifestWindowMs());
     }
 
     var response: std.Io.Writer.Allocating = .init(arena);

@@ -6,6 +6,7 @@ const std = @import("std");
 pub const c = @cImport({
     @cInclude("gdal.h");
     @cInclude("gdal_utils.h");
+    @cInclude("ogr_api.h");
     @cInclude("cpl_vsi.h");
     @cInclude("cpl_string.h");
     @cInclude("cpl_error.h");
@@ -116,6 +117,12 @@ pub fn vsiWrite(alloc: std.mem.Allocator, path: []const u8, bytes: []const u8) !
     }
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
+    // Content-Encoding metadata rides on the PUT only — set for this exact
+    // path, cleared after, so later reads of the same path carry no custom
+    // header (the PUT happens inside VSIFCloseL for /vsis3/).
+    const gz = if (gzip_prefix) |p| std.mem.startsWith(u8, path, p) else false;
+    if (gz) c.VSISetPathSpecificOption(path_z.ptr, "GDAL_HTTP_HEADERS", "Content-Encoding: gzip");
+    defer if (gz) c.VSIClearPathSpecificOptions(path_z.ptr);
     const file = c.VSIFOpenL(path_z.ptr, "wb") orelse return GdalError.VsiOpenFailed;
     const written = c.VSIFWriteL(bytes.ptr, 1, bytes.len, file);
     _ = c.VSIFCloseL(file);
@@ -214,10 +221,15 @@ pub fn isDir(alloc: std.mem.Allocator, path: []const u8) bool {
 /// Registers Content-Encoding on all writes under `prefix` (S3 PUT headers
 /// ride GDAL_HTTP_HEADERS; per-path so reads elsewhere are untouched).
 /// Everything written under the prefix MUST then be gzipped.
+/// Files under this prefix are stored gzipped with Content-Encoding metadata.
+/// NOT a path-specific GDAL option anymore: that applied the header to every
+/// request under the prefix — READS included — and custom headers on a
+/// signed S3 GET are a footgun. vsiWrite scopes it to the exact file being
+/// written and clears it after.
+var gzip_prefix: ?[]u8 = null;
+
 pub fn markPrefixGzip(alloc: std.mem.Allocator, prefix: []const u8) !void {
-    const prefix_z = try alloc.dupeZ(u8, prefix);
-    defer alloc.free(prefix_z);
-    c.VSISetPathSpecificOption(prefix_z.ptr, "GDAL_HTTP_HEADERS", "Content-Encoding: gzip");
+    gzip_prefix = try alloc.dupe(u8, prefix);
 }
 
 /// Unsigned S3 requests for a PUBLIC bucket (e.g. noaa-mrms-pds). Signed

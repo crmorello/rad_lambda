@@ -8,12 +8,20 @@
 #     --build-context radcore=$HOME/Developer/Swift/Playgrounds/raydare/radcore \
 #     -t rad-lambda .
 #
-# Keep both stages on the same distro release so libgdal sonames match.
+# Base: OSGeo's GDAL image, not Ubuntu's libgdal — the obs ingest reads
+# parquet through OGR and Ubuntu 24.04's libgdal 3.8 is built WITHOUT the
+# Parquet/Arrow driver (verified 2026-09-01). Both stages use the same image
+# so libgdal sonames match. H3 (obs hex rasterization) comes from apt.
 # For arm64 lambdas set ZIG_ARCH=aarch64 and build on/for arm64.
+ARG GDAL_IMAGE=ghcr.io/osgeo/gdal:ubuntu-full-3.11.4
 
-FROM ubuntu:24.04 AS build
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      libgdal-dev curl xz-utils ca-certificates \
+# The image ships Apache's Arrow apt source whose signing key is not in the
+# image (apt-get update fails: NO_PUBKEY); Arrow itself is already installed
+# and we add nothing from that repo, so drop the source before apt runs.
+FROM ${GDAL_IMAGE} AS build
+RUN rm -f /etc/apt/sources.list.d/apache-arrow.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
+      libh3-dev curl xz-utils ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 ARG ZIG_VERSION=0.16.0
 ARG ZIG_ARCH=x86_64
@@ -25,13 +33,17 @@ RUN curl -fsSL https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux
 COPY --from=radcore / /build/Swift/Playgrounds/raydare/radcore
 COPY zig /build/crystal/git/rad_lambda/zig
 WORKDIR /build/crystal/git/rad_lambda/zig
+# gdal-config --cflags is -I/usr/include in this image; libs are multiarch.
 RUN zig build -Doptimize=ReleaseFast \
-      -Dgdal-include=/usr/include/gdal \
-      -Dgdal-lib=/usr/lib/$(uname -m)-linux-gnu
+      -Dgdal-include=/usr/include \
+      -Dgdal-lib=/usr/lib/$(uname -m)-linux-gnu \
+      -Dh3-include=/usr/include \
+      -Dh3-lib=/usr/lib/$(uname -m)-linux-gnu
 
-FROM ubuntu:24.04
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      libgdal-dev ca-certificates \
+FROM ${GDAL_IMAGE}
+RUN rm -f /etc/apt/sources.list.d/apache-arrow.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
+      libh3-1 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /build/crystal/git/rad_lambda/zig/zig-out/bin/rad_lambda /var/runtime/bootstrap
 # RAD_OUTPUT (e.g. /vsis3/bucket/rads) is set on the function config

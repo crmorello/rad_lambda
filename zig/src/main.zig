@@ -5,8 +5,15 @@
 const std = @import("std");
 const gdal = @import("gdal.zig");
 const handler = @import("handler.zig");
+const obs = @import("obs.zig");
 const runtime = @import("runtime.zig");
 const manifest = @import("manifest.zig");
+
+/// std.log defaults to .err in ReleaseFast — which silently compiled the
+/// flow producer's info/warn lines OUT of the deployed binary. Everything
+/// this lambda logs is one short line per event; keep .info in all modes
+/// (stderr -> CloudWatch).
+pub const std_options: std.Options = .{ .log_level = .info };
 
 pub fn main(init: std.process.Init.Minimal) !void {
     const alloc = std.heap.c_allocator;
@@ -43,9 +50,28 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const maybe_out = args_it.next();
 
     const input = maybe_input orelse {
-        std.debug.print("Usage: rad_lambda <grib(.gz) | dir> [out_dir]\n", .{});
+        std.debug.print("Usage: rad_lambda <grib(.gz) | dir> [out_dir]\n" ++
+            "       rad_lambda --obs <obs.parquet> [out_dir]\n", .{});
         std.process.exit(1);
     };
+
+    // Observation surface (H3 parquet) -> obs/<variable>/ products. CLI-only
+    // for now; the S3 trigger for .parquet keys is a later hook in handleEvent.
+    if (std.mem.eql(u8, input, "--obs")) {
+        const parquet = maybe_out orelse {
+            std.debug.print("Usage: rad_lambda --obs <obs.parquet> [out_dir]\n", .{});
+            std.process.exit(1);
+        };
+        const out_dir = args_it.next() orelse (std.fs.path.dirname(parquet) orelse ".");
+        const written = try obs.ingest(alloc, parquet, out_dir, handler.resolution());
+        defer {
+            for (written) |w| alloc.free(w.path);
+            alloc.free(written);
+        }
+        for (written) |w| printOut("{s} ({d} bytes)\n", .{ w.path, w.bytes });
+        printOut("Wrote {d} obs product(s) under {s}/obs\n", .{ written.len, std.mem.trimEnd(u8, out_dir, "/") });
+        return;
+    }
 
     if (gdal.isDir(alloc, input)) {
         const out_dir = maybe_out orelse try std.fmt.allocPrint(alloc, "{s}/rads", .{input});
