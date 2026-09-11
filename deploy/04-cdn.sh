@@ -3,6 +3,17 @@
 # (objects carry Cache-Control? no — TTL set here; bodies are gzipped at rest
 # with Content-Encoding metadata, served as-is), short-TTL revalidation for
 # manifest.json, CORS for the web demo. Runs once; re-runs skip.
+#
+# 2026-09-04: the live distribution served obs/<var>/manifest.json under the
+# default long-TTL behavior (age > 1000 s) — it only had /rads/... behaviors.
+# A "*.json" behavior (every manifest, any product) is added below for NEW
+# distributions; an existing one gets it via deploy/07-cdn-obs-manifest.sh
+# (update-distribution with the ETag) plus an invalidation:
+#   aws cloudfront create-invalidation --distribution-id <ID> --paths /obs/<var>/manifest.json ...
+#   (invalidation wildcards must be the LAST character, so list the 13 manifests
+#   explicitly rather than "/obs/*", which would also evict the immutable frames)
+# Belt and braces: the lambda now also PUTs manifests with
+# Cache-Control: max-age=15, which the default CachingOptimized policy honors.
 set -euo pipefail
 cd "$(dirname "$0")" && source ./00-config.sh
 
@@ -79,8 +90,16 @@ DIST=$(aws cloudfront create-distribution --distribution-config "{
       \"CachedMethods\": {\"Quantity\": 2, \"Items\": [\"GET\", \"HEAD\"]}},
     \"Compress\": false
   },
-  \"CacheBehaviors\": {\"Quantity\": 1, \"Items\": [{
+  \"CacheBehaviors\": {\"Quantity\": 2, \"Items\": [{
     \"PathPattern\": \"*/manifest.json\",
+    \"TargetOriginId\": \"s3\", \"ViewerProtocolPolicy\": \"redirect-to-https\",
+    \"CachePolicyId\": \"${MANIFEST_POLICY_ID}\",
+    \"ResponseHeadersPolicyId\": \"${CORS_ID}\",
+    \"AllowedMethods\": {\"Quantity\": 2, \"Items\": [\"GET\", \"HEAD\"],
+      \"CachedMethods\": {\"Quantity\": 2, \"Items\": [\"GET\", \"HEAD\"]}},
+    \"Compress\": false
+  }, {
+    \"PathPattern\": \"*.json\",
     \"TargetOriginId\": \"s3\", \"ViewerProtocolPolicy\": \"redirect-to-https\",
     \"CachePolicyId\": \"${MANIFEST_POLICY_ID}\",
     \"ResponseHeadersPolicyId\": \"${CORS_ID}\",

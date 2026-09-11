@@ -75,7 +75,7 @@ pub fn warpBand(alloc: std.mem.Allocator, path: []const u8, resolution: f64) !Wa
     const argv = [_:null]?[*:0]const u8{
         "-of", "MEM", "-t_srs", "EPSG:3857", "-r", "med", "-tr", res.ptr, res.ptr,
     };
-    const options = c.GDALWarpAppOptionsNew(@constCast(@ptrCast(&argv)), null) orelse
+    const options = c.GDALWarpAppOptionsNew(@ptrCast(@constCast(&argv)), null) orelse
         return GdalError.WarpOptionsRejected;
     defer c.GDALWarpAppOptionsFree(options);
 
@@ -117,12 +117,25 @@ pub fn vsiWrite(alloc: std.mem.Allocator, path: []const u8, bytes: []const u8) !
     }
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
-    // Content-Encoding metadata rides on the PUT only — set for this exact
-    // path, cleared after, so later reads of the same path carry no custom
-    // header (the PUT happens inside VSIFCloseL for /vsis3/).
+    // PUT headers ride on this exact path and are cleared after, so later
+    // reads carry no custom header (the PUT happens inside VSIFCloseL for
+    // /vsis3/). Content-Encoding for gzip-at-rest; Cache-Control on every
+    // manifest.json so CloudFront's default "honor origin" behavior expires
+    // it quickly — stale manifests (age > 1000 s on obs/*/manifest.json,
+    // 2026-09-04) meant clients never saw new frames. Frames are immutable
+    // and keep the CDN's long TTL.
     const gz = if (gzip_prefix) |p| std.mem.startsWith(u8, path, p) else false;
-    if (gz) c.VSISetPathSpecificOption(path_z.ptr, "GDAL_HTTP_HEADERS", "Content-Encoding: gzip");
-    defer if (gz) c.VSIClearPathSpecificOptions(path_z.ptr);
+    const manifest = std.mem.endsWith(u8, path, "manifest.json");
+    const headers: ?[*:0]const u8 = if (gz and manifest)
+        "Content-Encoding: gzip,Cache-Control: max-age=15"
+    else if (gz)
+        "Content-Encoding: gzip"
+    else if (manifest)
+        "Cache-Control: max-age=15"
+    else
+        null;
+    if (headers) |h| c.VSISetPathSpecificOption(path_z.ptr, "GDAL_HTTP_HEADERS", h);
+    defer if (headers != null) c.VSIClearPathSpecificOptions(path_z.ptr);
     const file = c.VSIFOpenL(path_z.ptr, "wb") orelse return GdalError.VsiOpenFailed;
     const written = c.VSIFWriteL(bytes.ptr, 1, bytes.len, file);
     _ = c.VSIFCloseL(file);

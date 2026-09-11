@@ -12,6 +12,7 @@ const gdal = @import("gdal.zig");
 const stamp = @import("stamp.zig");
 const manifest = @import("manifest.zig");
 const obs = @import("obs.zig");
+const tiles = @import("tiles.zig");
 
 /// Pixel density of the prod CONUS precip output (6373x4161 over the CONUS
 /// mercator extent). Every region is warped to this so all RADs share one
@@ -261,6 +262,31 @@ fn collectS3Records(arena: std.mem.Allocator, event: std.json.Value, out: *std.A
 /// deploy config leaking into the binary.
 pub const InputKind = enum { radar, obs };
 
+/// Optional comma-separated allow-list of key prefixes (RAD_KEY_PREFIXES).
+/// Unset = accept any key, which is the radar behaviour (its trigger is an SNS
+/// filter policy scoped to the SeamlessHSR paths already).
+///
+/// Set it when the TRIGGER is broader than the product's own prefix. The obs
+/// source is `ft.weatherflow.com`, a general-purpose bucket whose producer
+/// invokes this function on every write it makes, so that function sets
+/// `gcc/output/`. Without it, kindForKey routes on extension alone and a
+/// stray .parquet anywhere in the bucket would be ingested as an obs issuance.
+fn keyAllowed(key: []const u8) bool {
+    return prefixAllowed(key, getenv("RAD_KEY_PREFIXES"));
+}
+
+/// The rule itself, taking the list explicitly so it is testable without
+/// mutating the process environment. `null` list = accept everything.
+fn prefixAllowed(key: []const u8, list: ?[]const u8) bool {
+    const l = list orelse return true;
+    var it = std.mem.splitScalar(u8, l, ',');
+    while (it.next()) |raw| {
+        const p = std.mem.trim(u8, raw, " ");
+        if (p.len > 0 and std.mem.startsWith(u8, key, p)) return true;
+    }
+    return false;
+}
+
 pub fn kindForKey(key: []const u8) ?InputKind {
     // Same extension set main.zig walks in CLI directory mode.
     if (std.mem.endsWith(u8, key, ".grib2") or
@@ -294,6 +320,9 @@ fn ingestObs(arena: std.mem.Allocator, input: []const u8) ![][]const u8 {
 /// except obs.ingest — see ingestObs.
 pub fn handleEvent(arena: std.mem.Allocator, event_json: []const u8) ![]const u8 {
     const event = try std.json.parseFromSliceLeaky(std.json.Value, arena, event_json, .{});
+    // Function-URL requests (the tile endpoint) arrive as HTTP events, not
+    // S3 records: route them and return the HTTP response JSON.
+    if (tiles.isHttpEvent(event)) return tiles.handleHttp(arena, event);
 
     var records: std.ArrayList(std.json.Value) = .empty;
     try collectS3Records(arena, event, &records);
@@ -312,6 +341,14 @@ pub fn handleEvent(arena: std.mem.Allocator, event_json: []const u8) ![]const u8
         // object in a watched prefix should not do that. A real upstream
         // rename still surfaces: nothing gets written, so the freshness alarm
         // (deploy/05-alarms.sh) fires on its own.
+        // Cheapest gate first: an over-broad trigger (see keyAllowed) means most
+        // records are none of our business, and this rejects them before any
+        // extension match or GDAL work.
+        if (!keyAllowed(key)) {
+            std.log.warn("skipping {s}: outside RAD_KEY_PREFIXES", .{key});
+            skipped += 1;
+            continue;
+        }
         const kind = kindForKey(key) orelse {
             std.log.warn("skipping {s}: no producer for this key", .{key});
             skipped += 1;
@@ -438,4 +475,31 @@ test "handleEvent: unroutable and stampless keys skip instead of failing the bat
             try handleEvent(arena, event),
         );
     }
+}
+
+test "prefixAllowed: RAD_KEY_PREFIXES narrows an over-broad trigger" {
+    // Unset = accept everything. That is the radar case: its SNS filter policy
+    // already scopes the trigger to the SeamlessHSR paths.
+    try std.testing.expect(prefixAllowed("anything/at/all.parquet", null));
+    try std.testing.expect(prefixAllowed("", null));
+
+    // The obs case: the producer invokes us for every write to
+    // ft.weatherflow.com, so only gcc/output/ is ours.
+    const one = "gcc/output/";
+    try std.testing.expect(prefixAllowed("gcc/output/1788296100_slim.parquet", one));
+    try std.testing.expect(!prefixAllowed("gcc/1788296100_slim.parquet", one));
+    try std.testing.expect(!prefixAllowed("other/1788296100_slim.parquet", one));
+    // A stray parquet elsewhere in the bucket must NOT become an obs issuance:
+    // kindForKey matches on extension alone, so this gate is what stops it.
+    try std.testing.expect(!prefixAllowed("uploads/random.parquet", one));
+
+    // Comma list with padding, written the way RAD_UNSIGNED_BUCKETS is.
+    const two = "gcc/output/, alt/feed/";
+    try std.testing.expect(prefixAllowed("gcc/output/x.parquet", two));
+    try std.testing.expect(prefixAllowed("alt/feed/x.parquet", two));
+    try std.testing.expect(!prefixAllowed("nope/x.parquet", two));
+
+    // An empty or whitespace-only value must not accidentally allow everything.
+    try std.testing.expect(!prefixAllowed("gcc/output/x.parquet", ""));
+    try std.testing.expect(!prefixAllowed("gcc/output/x.parquet", " , "));
 }

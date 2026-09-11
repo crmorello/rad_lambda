@@ -48,8 +48,20 @@ via VSI (local path or `/vsis3/bucket/prefix`).
   manifest URLs obs writes. No 10-minute grid gate (issuances are off the
   lattice) and no region prefix (H3 is global). Extra config:
   `RAD_OBS_SMOOTH` (kernel scale in cell half-widths, default 1.0; 0 disables
-  and reproduces the unsmoothed plateaus byte-for-byte). Separate functions
-  keep the two products' memory, timeout, concurrency and DLQ independent.
+  and reproduces the unsmoothed plateaus byte-for-byte), and
+  `RAD_MANIFEST_HOURS=12` in production — at the 5-minute issuance cadence that
+  is 144 frames per variable manifest (radar keeps the 3 h default). Whatever
+  the obs lifecycle TTL ends up being, it must exceed this window or the
+  manifests will list frames S3 has already expired. Separate functions keep
+  the two products' memory, timeout, concurrency and DLQ independent.
+- **`RAD_KEY_PREFIXES`** (optional, comma-separated) restricts which keys a
+  function will act on; anything outside is counted in `skipped`. Set it when
+  the TRIGGER is broader than the product's prefix — the obs producer invokes
+  on every write to its bucket, so that function sets `gcc/output/`. Without
+  it, routing is by extension alone and a stray `.parquet` elsewhere in that
+  bucket would be ingested as an obs issuance (verified: it publishes 13 bogus
+  products). Radar leaves it unset; its SNS filter policy already scopes the
+  trigger.
 - **CLI**: `rad_lambda <grib(.gz) | dir> [out_dir]`, or
   `rad_lambda --obs <file.parquet> [out_dir]`, for local testing (plain files,
   no gzip, unwindowed manifests).
@@ -93,3 +105,41 @@ against a reference image and must stay byte-identical. See
 Base-only RADs for now — mixed-phase typing (temp/dew masks) is the known
 next step and changes this to a multi-input handler (port it into radcore
 when it lands, not just here).
+
+
+## Raster tiles (`/tiles/v1/…`)
+
+The same image serves XYZ raster tiles rendered on demand from the RAD3
+frames in the bucket (radcore `tile.zig`), meant to sit behind CloudFront
+so each tile is rendered once per stamp and cached forever:
+
+    GET /tiles/v1/<product>/<stamp>/<z>/<x>/<y>.png[?tms=1&size=512&palette=1]
+    GET /tiles/v1/<product>/latest/<z>/<x>/<y>.png      -> 302 to the newest stamp
+    GET /tiles/v1/<product>/manifest.json                -> the product manifest
+    GET /tiles/v1/<product>/timerange                    -> {"timestamps":[ISO8601…]}
+
+`product` is a registry id (`rads`, `obs/temperature`, …), `stamp` is
+`YYYYMMDD-HHMMSS`. Zoom 0–14; XYZ y by default, `tms=1` flips it. The
+function reads `RAD_TILES_ROOT` (`/vsis3/<bucket>`, the dir holding `rads/`
+and `obs/`) and keeps whole frames in a warm-container cache
+(`RAD_TILES_CACHE_MB`, default 256). Zoomed out the tile is a class-aware
+box filter of the frame lattice; zoomed in it is the app shader's
+reconstruction (Catmull-Rom, nodata-aware, radar bands kept crisp).
+
+Local check without AWS:
+
+    zig build -Doptimize=ReleaseFast
+    ./zig-out/bin/rad_lambda --tile <root> rads 20260712-010000 7 28 48 tile.png
+    ./zig-out/bin/rad_lambda --tile <root> obs/temperature 20260901-205500 9 114 195 t.png
+
+(`<root>` = any dir with `rads/manifest.json` + frames, e.g. the one
+raydare's `scripts/serve-rad3.sh` builds.) `test/e2e_local.sh` covers the
+HTTP path (200 PNG, `latest` 302, unknown product 404, timerange).
+
+Deploy: `deploy/08-tiles.sh <distribution-id>` (a second function from the
+same image with a Function URL, a cache policy keyed on path + tms/size/
+palette, and a `/tiles/*` behavior on the existing distribution) and
+`deploy/09-tiles-auth.sh <distribution-id> <keys-file>` (api keys in a
+CloudFront KeyValueStore checked by a viewer-request function, stripped
+before caching). Both are plain aws-cli and re-runnable; neither has been
+run against the live account yet.

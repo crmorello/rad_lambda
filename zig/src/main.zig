@@ -6,6 +6,16 @@ const std = @import("std");
 const gdal = @import("gdal.zig");
 const handler = @import("handler.zig");
 const obs = @import("obs.zig");
+const tiles = @import("tiles.zig");
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+fn c_setenv(name: [:0]const u8, value: []const u8) c_int {
+    var buf: [1024]u8 = undefined;
+    if (value.len >= buf.len) return -1;
+    @memcpy(buf[0..value.len], value);
+    buf[value.len] = 0;
+    return setenv(name.ptr, buf[0..value.len :0].ptr, 1);
+}
 const runtime = @import("runtime.zig");
 const manifest = @import("manifest.zig");
 
@@ -57,6 +67,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Observation surface (H3 parquet) -> obs/<variable>/ products. CLI-only
     // for now; the S3 trigger for .parquet keys is a later hook in handleEvent.
+    // Raster tile to a file: rad_lambda --tile <root> <product> <stamp> <z> <x> <y> [out.png]
+    // (<root> = the served root holding rads/ and obs/, local dir or /vsis3/bucket)
+    if (std.mem.eql(u8, input, "--tile")) {
+        const root = maybe_out orelse {
+            std.debug.print("Usage: rad_lambda --tile <root> <product> <stamp> <z> <x> <y> [out.png]\n", .{});
+            std.process.exit(1);
+        };
+        const product = args_it.next() orelse std.process.exit(1);
+        const st = args_it.next() orelse std.process.exit(1);
+        const z = try std.fmt.parseInt(u32, args_it.next() orelse std.process.exit(1), 10);
+        const x = try std.fmt.parseInt(u32, args_it.next() orelse std.process.exit(1), 10);
+        const y = try std.fmt.parseInt(u32, args_it.next() orelse std.process.exit(1), 10);
+        const out_path = args_it.next() orelse "tile.png";
+        // the tile module reads its root from the environment (lambda contract)
+        _ = c_setenv("RAD_TILES_ROOT", root);
+        try tiles.renderToFile(alloc, .{ .product = product, .stamp = st, .z = z, .x = x, .y = y }, out_path);
+        return;
+    }
+
     if (std.mem.eql(u8, input, "--obs")) {
         const parquet = maybe_out orelse {
             std.debug.print("Usage: rad_lambda --obs <obs.parquet> [out_dir]\n", .{});

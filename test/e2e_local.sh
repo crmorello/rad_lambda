@@ -68,6 +68,7 @@ docker run -d --rm --name "$LAMBDA" --network "$NET" -p 9080:8080 \
   -e AWS_ACCESS_KEY_ID=e2e -e AWS_SECRET_ACCESS_KEY=e2esecret \
   -e AWS_S3_ENDPOINT="$MINIO:9000" -e AWS_HTTPS=NO -e AWS_VIRTUAL_HOSTING=FALSE \
   -e RAD_OUTPUT=/vsis3/rad-output/rads -e RAD_URL_PREFIX=/rads \
+  -e RAD_TILES_ROOT=/vsis3/rad-output \
   -e RAD_MANIFEST_HOURS=0 \
   "$IMAGE" /var/runtime/bootstrap >/dev/null
 sleep 2
@@ -139,6 +140,7 @@ docker run -d --rm --name "$OBSFN" --network "$NET" -p 9081:8080 \
   -e AWS_ACCESS_KEY_ID=e2e -e AWS_SECRET_ACCESS_KEY=e2esecret \
   -e AWS_S3_ENDPOINT="$MINIO:9000" -e AWS_HTTPS=NO -e AWS_VIRTUAL_HOSTING=FALSE \
   -e RAD_OUTPUT=/vsis3/rad-output -e RAD_MANIFEST_HOURS=0 \
+  -e RAD_KEY_PREFIXES=gcc/output/ \
   "$IMAGE" /var/runtime/bootstrap >/dev/null
 sleep 2
 
@@ -194,4 +196,37 @@ echo "$R6" | grep -q "OpenFailed" \
 echo "$R6" | grep -q "/vsis3/rad-output/obs/temperature/$OBS_STAMP2.rad" \
   || fail "warm-container obs invocation did not produce the expected frame"
 
-echo "E2E PASS: radar + skip + gzip metadata + manifest + byte parity + obs + warm reuse"
+# --- 7: a parquet OUTSIDE the allow-listed prefix is skipped ---------------
+# The obs producer invokes the function on every write to its bucket, not just
+# gcc/output/, and kindForKey routes on extension alone — so without
+# RAD_KEY_PREFIXES a stray parquet anywhere in that bucket would be ingested as
+# an obs issuance and publish 13 bogus products.
+docker exec "$MINIO" mc cp /tmp/obs.parquet "local/obs-input/uploads/$OBS_NAME" >/dev/null
+R7=$(curl -sf -XPOST http://localhost:9081/2015-03-31/functions/function/invocations \
+  -d "$(printf '{"Records":[{"s3":{"bucket":{"name":"obs-input"},"object":{"key":"uploads/%s"}}}]}' "$OBS_NAME")")
+echo "off-prefix -> $R7"
+echo "$R7" | grep -q '"processed":\[\],"skipped":1' || fail "parquet outside RAD_KEY_PREFIXES was not skipped"
+docker exec "$MINIO" mc ls local/rad-output/obs/temperature/ 2>/dev/null | grep -q "$OBS_STAMP.rad" \
+  || fail "sanity: the in-prefix frame should still exist"
+
+# --- 8: raster tiles from the same container (function-URL HTTP events) ----
+# A z5 tile over the central US for the ingested stamp must be a PNG; `latest`
+# must redirect to that stamp; an unknown product is a 404. Tiles render from
+# the RAD frames just written to MinIO (RAD_TILES_ROOT = bucket root).
+http_event() { printf '{"rawPath":"%s","rawQueryString":"","queryStringParameters":{}}' "$1"; }
+T1=$(invoke "$(http_event "/tiles/v1/rads/$ON_STAMP/5/7/12.png")")
+echo "tile -> $(echo "$T1" | cut -c1-120)..."
+echo "$T1" | grep -q '"statusCode":200' || fail "tile request did not return 200"
+echo "$T1" | grep -q '"Content-Type":"image/png"' || fail "tile content type"
+echo "$T1" | grep -q 'max-age=31536000, immutable' || fail "tile cache-control"
+echo "$T1" | sed -n 's/.*"body":"\([^"]*\)".*/\1/p' | base64 -d | head -c 4 | od -An -c | grep -q "211   P   N   G" \
+  || fail "tile body is not a PNG"
+T2=$(invoke "$(http_event "/tiles/v1/rads/latest/5/7/12.png")")
+echo "$T2" | grep -q '"statusCode":302' || fail "latest did not redirect"
+echo "$T2" | grep -q "\"Location\":\"/tiles/v1/rads/$ON_STAMP/5/7/12.png\"" || fail "latest redirected to the wrong stamp"
+T3=$(invoke "$(http_event "/tiles/v1/nope/$ON_STAMP/5/7/12.png")")
+echo "$T3" | grep -q '"statusCode":404' || fail "unknown product was not a 404"
+T4=$(invoke "$(http_event "/tiles/v1/rads/timerange")")
+echo "$T4" | grep -q '"timestamps":\[' || fail "timerange shape"
+
+echo "E2E PASS: radar + skip + gzip metadata + manifest + byte parity + obs + warm reuse + prefix filter + tiles"

@@ -292,27 +292,39 @@ pub fn rasterize(alloc: std.mem.Allocator, cells: []const h3.H3Index, res: []con
         }
     }
     const grid = snapGrid(min_x, min_y, max_x, max_y, pw);
+    const all = try alloc.alloc(u32, cells.len);
+    defer alloc.free(all);
+    for (all, 0..) |*e, i| e.* = @intCast(i);
+    return rasterizeInto(alloc, cells, res, all, grid);
+}
+
+/// Paint the cells at `indices` (indices into `cells`/`res`, and therefore
+/// into the table's value columns) onto `grid`, coarse resolutions first so
+/// finer cells win shared edges, then close source-tiling gaps.
+pub fn rasterizeInto(alloc: std.mem.Allocator, cells: []const h3.H3Index, res: []const u8, indices: []const u32, grid: Grid) !IndexMap {
     const map = try alloc.alloc(u32, grid.len());
     errdefer alloc.free(map);
     @memset(map, NONE);
 
+    var buf: [h3.MAX_CELL_BNDRY_VERTS][2]f64 = undefined;
     var lo: u8 = 255;
     var hi: u8 = 0;
-    for (res) |r| {
-        lo = @min(lo, r);
-        hi = @max(hi, r);
+    for (indices) |i| {
+        lo = @min(lo, res[i]);
+        hi = @max(hi, res[i]);
     }
     var lvl = lo;
     while (lvl <= hi) : (lvl += 1) {
-        for (cells, res, 0..) |cell, r, i| {
-            if (r != lvl) continue;
+        for (indices) |i| {
+            if (res[i] != lvl) continue;
+            const cell = cells[i];
             const ms = try boundaryMeters(cell, &buf);
             var px: [h3.MAX_CELL_BNDRY_VERTS][2]f64 = undefined;
             for (ms, 0..) |m, k| px[k] = grid.toPixel(m[0], m[1]);
             var ll: h3.LatLng = undefined;
             if (h3.cellToLatLng(cell, &ll) != 0) return error.H3Center;
             const cm = mercator(ll.lat, ll.lng);
-            paintPolygon(map, grid.width, grid.height, px[0..ms.len], grid.toPixel(cm[0], cm[1]), @intCast(i));
+            paintPolygon(map, grid.width, grid.height, px[0..ms.len], grid.toPixel(cm[0], cm[1]), i);
         }
         if (lvl == 255) break;
     }
@@ -397,6 +409,12 @@ pub fn smoothRadii(scale: f64, pw: f64, lat_mean: f64) [MAX_RES + 1]u32 {
 }
 
 /// Latitude (radians) of a Mercator y.
+/// RAD_RAD3 unset or anything but "0" → write RAD3; "0" → RAD2.
+fn rad3Enabled() bool {
+    const v = handler.getenv("RAD_RAD3") orelse return true;
+    return !std.mem.eql(u8, v, "0");
+}
+
 fn latOfY(y: f64) f64 {
     return 2 * std.math.atan(@exp(y * std.math.pi / HALF_WORLD)) - std.math.pi / 2.0;
 }
@@ -625,8 +643,14 @@ pub fn ingest(alloc: std.mem.Allocator, input: []const u8, out_dir: []const u8, 
     for (products) |p| {
         const band = try bandFor(alloc, &table, &map, p, radius);
         defer alloc.free(band);
-        const rad = try radcore.writeRadV2(alloc, s.ms(), map.grid.geoTran(), @intCast(map.grid.width), @intCast(map.grid.height), 0, band);
+        // RAD3 (paged best-of stream) by default — dense obs fields compress
+        // 3–190× versus RAD2's zero-run RLE. RAD_RAD3=0 keeps writing RAD2.
+        const rad = if (rad3Enabled())
+            try radcore.rad3.writeRadV3(alloc, s.ms(), map.grid.geoTran(), @intCast(map.grid.width), @intCast(map.grid.height), 0, band)
+        else
+            try radcore.writeRadV2(alloc, s.ms(), map.grid.geoTran(), @intCast(map.grid.width), @intCast(map.grid.height), 0, band);
         defer alloc.free(rad);
+        log.info("{s}: {d} bytes ({s})", .{ p.id, rad.len, rad[0..4] });
 
         const dir = try std.fmt.allocPrintSentinel(alloc, "{s}/{s}", .{ base, p.id }, 0);
         defer alloc.free(dir);
@@ -1122,7 +1146,7 @@ test "ingest: gzip bodies round-trip, window is honoured (needs RAD_OBS_SAMPLE +
             try testing.expect(raw.len > 2 and raw[0] == 0x1f and raw[1] == 0x8b);
             const body = try manifest.gunzipIfNeeded(alloc, raw); // takes ownership of raw
             defer alloc.free(body);
-            const magic: []const u8 = if (std.mem.endsWith(u8, w.path, ".flw")) "FLW1" else "RAD2";
+            const magic: []const u8 = if (std.mem.endsWith(u8, w.path, ".flw")) "FLW1" else "RAD3";
             try testing.expectEqualStrings(magic, body[0..4]);
             // Written.bytes is the RAW size, not the at-rest size.
             if (std.mem.endsWith(u8, w.path, ".rad")) try testing.expectEqual(body.len, w.bytes);
@@ -1150,7 +1174,7 @@ test "ingest: gzip bodies round-trip, window is honoured (needs RAD_OBS_SAMPLE +
         for (written) |w| {
             const body = (try gdal.vsiRead(alloc, w.path)) orelse return error.MissingOutput;
             defer alloc.free(body);
-            const magic: []const u8 = if (std.mem.endsWith(u8, w.path, ".flw")) "FLW1" else "RAD2";
+            const magic: []const u8 = if (std.mem.endsWith(u8, w.path, ".flw")) "FLW1" else "RAD3";
             try testing.expectEqualStrings(magic, body[0..4]);
         }
 
