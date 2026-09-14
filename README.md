@@ -143,3 +143,10 @@ palette, and a `/tiles/*` behavior on the existing distribution) and
 CloudFront KeyValueStore checked by a viewer-request function, stripped
 before caching). Both are plain aws-cli and re-runnable; neither has been
 run against the live account yet.
+
+## RAD3 output
+
+Both producers write RAD3 (radcore `docs/rad-format.md`): radar warps since
+2026-09-11 (CONUS ≈ 0.53 MB vs 0.73 MB RAD2 on the test grib, byte-identical
+to `bench --rad3` re-encoding the RAD2 output) and obs products since the
+same day. `RAD_RAD3=0` on a function falls back to RAD2; clients decode both.

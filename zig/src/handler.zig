@@ -25,12 +25,35 @@ pub var gzip_output = false;
 /// Precompute .flw flow sidecars at ingest (RAD_FLOW=0 opts out). Spec:
 /// radcore/docs/flw-format.md — the flow ending at frame X.rad is X.flw.
 pub var flow_enabled = true;
-/// Flow estimate LOD for the .flw sidecar (see flowSidecar).
-pub const FLOW_LOD: u32 = 2;
+/// Flow estimate LOD for the .flw sidecar (see flowSidecar): node spacing is
+/// BLOCK(32) * CONUS_PIXEL_SIZE_M * lod, so lod 1 = ~39 km — matching obs's
+/// wind-grid density, and fine enough to resolve individual precip cells
+/// (lod 2's ~78 km grid was too coarse for that, see FLOW_SEARCH below for
+/// why lod alone isn't what capped detectable speed).
+pub const FLOW_LOD: u32 = 1;
+/// Block-match search radius in texels, INDEPENDENT of FLOW_LOD (see
+/// flow.zig's estimateSearch — a lambda-only knob; the client's synchronous
+/// local-fallback estimate stays at the comptime SEARCH=8 to keep its
+/// on-device cost down). Search scales the detectable-speed ceiling:
+/// FLOW_SEARCH * CONUS_PIXEL_SIZE_M / 600s. At lod 1 with SEARCH=8 that
+/// ceiling was only ~16.3 m/s (measured: every echo above it went unmatched
+/// and diffusion-filled, mean speeds ~30% low) — the original reason lod
+/// alone was bumped to 2, which fixed the ceiling (~32.6 m/s) but doubled
+/// node spacing as a side effect. Decoupling the two: FLOW_SEARCH=20 at the
+/// finer lod=1 grid gives ~40.8 m/s, comfortably above typical severe-
+/// convection cell motion, without lod 2's coarser grid.
+pub const FLOW_SEARCH: i32 = 20;
 
 /// The pipeline's slice cadence: frames land on 10-minute boundaries, so the
 /// previous frame of a pair is exactly one slice back.
 pub const SLICE_INTERVAL_MS: i64 = 10 * std.time.ms_per_min;
+
+/// RAD_RAD3 unset or anything but "0" → write RAD3; "0" → RAD2. One switch
+/// for radar and obs.
+pub fn rad3Enabled() bool {
+    const v = getenv("RAD_RAD3") orelse return true;
+    return !std.mem.eql(u8, v, "0");
+}
 
 /// libc getenv (std.posix.getenv is gone in 0.16; we link libc anyway).
 pub fn getenv(key: [:0]const u8) ?[]const u8 {
@@ -95,8 +118,15 @@ pub fn processFile(alloc: std.mem.Allocator, input: []const u8, out_dir: []const
     const warped = try gdal.warpBand(alloc, input, res);
     defer alloc.free(warped.band);
 
-    const rad = try radcore.writeRadV2(alloc, s.ms(), warped.geo_tran, warped.max_x, warped.max_y, warped.no_data, warped.band);
+    // RAD3 (paged best-of stream) for radar too — CONUS 0.79 → 0.55 MB,
+    // Alaska 0.31 → 0.13 MB, and page-addressable decode in the clients.
+    // RAD_RAD3=0 keeps RAD2 (every client decodes both).
+    const rad = if (rad3Enabled())
+        try radcore.rad3.writeRadV3(alloc, s.ms(), warped.geo_tran, warped.max_x, warped.max_y, warped.no_data, warped.band)
+    else
+        try radcore.writeRadV2(alloc, s.ms(), warped.geo_tran, warped.max_x, warped.max_y, warped.no_data, warped.band);
     defer alloc.free(rad);
+    std.log.info("{s}{s}: {d} bytes ({s})", .{ id_prefix, s.slice(), rad.len, rad[0..4] });
     const body = if (gzip_output) try manifest.gzipBytes(alloc, rad) else rad;
     defer if (gzip_output) alloc.free(body);
 
@@ -161,10 +191,10 @@ fn flowSidecar(alloc: std.mem.Allocator, out_dir: []const u8, id_prefix: []const
     const ph = radcore.store.parseRadHeader(prev_rad) orelse return error.BadPreviousRad;
     const nh = radcore.store.parseRadHeader(next_rad) orelse return error.BadNextRad;
 
-    // lod 2, like the client's own estimate: the ±8-texel search window is a
-    // speed ceiling (16.3 m/s at lod 1 over a 10-min gap — measured: every
-    // echo above it went unmatched and diffusion-filled, mean speeds ~30 %
-    // low). lod 2 doubles the ceiling to 32.6 m/s at a 78 km node grid.
+    // FLOW_LOD (grid density) and FLOW_SEARCH (speed ceiling) are decoupled —
+    // see their doc comments above for why. This is the lambda's async,
+    // one-time ingest cost; the client's local-fallback estimate stays cheap
+    // (comptime SEARCH=8) since it runs synchronously on-device.
     const flw = try radcore.flow_file.flowFileForPair(
         alloc,
         recOf(prev_rad, ph),
@@ -173,6 +203,7 @@ fn flowSidecar(alloc: std.mem.Allocator, out_dir: []const u8, id_prefix: []const
         nh.time,
         FLOW_LOD,
         radcore.flow_file.DEFAULT_VEC_SCALE,
+        FLOW_SEARCH,
     );
     defer alloc.free(flw);
     const flw_body = if (gzip_output) try manifest.gzipBytes(alloc, flw) else flw;

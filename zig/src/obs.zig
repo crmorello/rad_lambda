@@ -409,12 +409,6 @@ pub fn smoothRadii(scale: f64, pw: f64, lat_mean: f64) [MAX_RES + 1]u32 {
 }
 
 /// Latitude (radians) of a Mercator y.
-/// RAD_RAD3 unset or anything but "0" → write RAD3; "0" → RAD2.
-fn rad3Enabled() bool {
-    const v = handler.getenv("RAD_RAD3") orelse return true;
-    return !std.mem.eql(u8, v, "0");
-}
-
 fn latOfY(y: f64) f64 {
     return 2 * std.math.atan(@exp(y * std.math.pi / HALF_WORLD)) - std.math.pi / 2.0;
 }
@@ -645,7 +639,7 @@ pub fn ingest(alloc: std.mem.Allocator, input: []const u8, out_dir: []const u8, 
         defer alloc.free(band);
         // RAD3 (paged best-of stream) by default — dense obs fields compress
         // 3–190× versus RAD2's zero-run RLE. RAD_RAD3=0 keeps writing RAD2.
-        const rad = if (rad3Enabled())
+        const rad = if (handler.rad3Enabled())
             try radcore.rad3.writeRadV3(alloc, s.ms(), map.grid.geoTran(), @intCast(map.grid.width), @intCast(map.grid.height), 0, band)
         else
             try radcore.writeRadV2(alloc, s.ms(), map.grid.geoTran(), @intCast(map.grid.width), @intCast(map.grid.height), 0, band);

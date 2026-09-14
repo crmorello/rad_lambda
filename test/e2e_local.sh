@@ -106,7 +106,7 @@ docker exec "$MINIO" mc cat local/rad-output/rads/manifest.json > "$WORK/manifes
 gunzip -c "$WORK/out.rad.gz" > "$WORK/out.rad"
 gunzip -c "$WORK/manifest.json.gz" > "$WORK/manifest.json"
 
-head -c4 "$WORK/out.rad" | grep -q "RAD2" || fail "rad missing RAD2 magic"
+head -c4 "$WORK/out.rad" | grep -q "RAD3" || fail "rad missing RAD3 magic"
 grep -q "\"url\":\"/rads/$ON_STAMP.rad\"" "$WORK/manifest.json" || fail "manifest missing frame url"
 grep -q '"product":"reflectivity"' "$WORK/manifest.json" || fail "manifest product wrong"
 
@@ -161,7 +161,7 @@ docker exec "$MINIO" mc stat "local/rad-output/obs/temperature/$OBS_STAMP.rad" >
 grep -qi "Content-Encoding.*gzip" "$WORK/stat_obs" || fail "obs rad missing Content-Encoding: gzip"
 docker exec "$MINIO" mc cat "local/rad-output/obs/temperature/$OBS_STAMP.rad" > "$WORK/obs.rad.gz"
 gunzip -c "$WORK/obs.rad.gz" > "$WORK/obs.rad" || fail "obs rad is tagged gzip but does not inflate"
-head -c4 "$WORK/obs.rad" | grep -q "RAD2" || fail "obs rad missing RAD2 magic"
+head -c4 "$WORK/obs.rad" | grep -q "RAD3" || fail "obs rad missing RAD3 magic"
 
 docker exec "$MINIO" mc stat local/rad-output/obs/temperature/manifest.json > "$WORK/stat_obs_m" 2>&1
 grep -qi "Content-Encoding.*gzip" "$WORK/stat_obs_m" || fail "obs manifest missing Content-Encoding: gzip"
