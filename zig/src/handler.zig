@@ -26,22 +26,34 @@ pub var gzip_output = false;
 /// radcore/docs/flw-format.md — the flow ending at frame X.rad is X.flw.
 pub var flow_enabled = true;
 /// Flow estimate LOD for the .flw sidecar (see flowSidecar): node spacing is
-/// BLOCK(32) * CONUS_PIXEL_SIZE_M * lod, so lod 1 = ~39 km — matching obs's
-/// wind-grid density, and fine enough to resolve individual precip cells
-/// (lod 2's ~78 km grid was too coarse for that, see FLOW_SEARCH below for
-/// why lod alone isn't what capped detectable speed).
+/// BLOCK(32) * CONUS_PIXEL_SIZE_M * lod — lod 2 = ~78 km. A lod=1 (~39 km)
+/// experiment was tried and REVERTED on 2026-09-14 for a DIFFERENT symptom
+/// (crossfade/keyframing): measured on real CONUS pairs, lod 1 had both a
+/// lower match rate (5.1-5.7% vs lod 2's 6.8-8.3%) and materially worse
+/// frame-to-frame consistency of WHICH nodes matched (76-78% set overlap
+/// vs 79-89% at lod 2) — the finer grid is noisier per block without a
+/// compensating change to the diffusion-fill pass count.
+///
+/// RE-TESTING at lod=1 again (2026-09-14, local only, NOT deployed) for a
+/// new, distinct symptom: visible warping/ghosting where a 78km node covers
+/// an area with sharply non-uniform motion (rotation, a fast cell embedded
+/// in slower stratiform rain) and the coarse vector gets bilinearly smeared
+/// across the whole cell. Finer nodes may trade the earlier-measured
+/// keyframe/noise cost for less per-cell motion averaging — that tradeoff
+/// hasn't been measured for THIS symptom yet. Revert to 2 if it doesn't
+/// help or reintroduces the keyframe symptom.
 pub const FLOW_LOD: u32 = 1;
 /// Block-match search radius in texels, INDEPENDENT of FLOW_LOD (see
 /// flow.zig's estimateSearch — a lambda-only knob; the client's synchronous
 /// local-fallback estimate stays at the comptime SEARCH=8 to keep its
 /// on-device cost down). Search scales the detectable-speed ceiling:
-/// FLOW_SEARCH * CONUS_PIXEL_SIZE_M / 600s. At lod 1 with SEARCH=8 that
-/// ceiling was only ~16.3 m/s (measured: every echo above it went unmatched
-/// and diffusion-filled, mean speeds ~30% low) — the original reason lod
-/// alone was bumped to 2, which fixed the ceiling (~32.6 m/s) but doubled
-/// node spacing as a side effect. Decoupling the two: FLOW_SEARCH=20 at the
-/// finer lod=1 grid gives ~40.8 m/s, comfortably above typical severe-
-/// convection cell motion, without lod 2's coarser grid.
+/// FLOW_SEARCH * CONUS_PIXEL_SIZE_M / 600s. At lod 2 with the old SEARCH=8
+/// that ceiling was only ~32.6 m/s (echoes faster than that went unmatched
+/// and diffusion-filled — the original "looks like a plain fade" report).
+/// Measured: widening search alone (keeping lod 2) barely moves match rate
+/// or frame-to-frame stability at all — this knob was never the source of
+/// the lod-1 regression above, it's a clean, independent win. FLOW_SEARCH=20
+/// at lod 2 gives ~81.5 m/s, comfortably above any real precip motion.
 pub const FLOW_SEARCH: i32 = 20;
 
 /// The pipeline's slice cadence: frames land on 10-minute boundaries, so the
@@ -216,6 +228,59 @@ fn flowSidecar(alloc: std.mem.Allocator, out_dir: []const u8, id_prefix: []const
     std.log.info("flow sidecar {s}{s}.flw: {d} B raw, {d} B at rest", .{
         id_prefix, s.slice(), flw.len, flw_body.len,
     });
+}
+
+/// Local dev/QA tool: regenerate one "{next_id}.flw" from two EXISTING .rad
+/// files already on disk (no GRIB2/S3 needed) — same estimator, same
+/// FLOW_LOD/FLOW_SEARCH/vec_scale as production `flowSidecar`, so a fixture
+/// pair run through this produces exactly what the lambda would write today.
+/// For visually checking a tuning change before deploying: point raydare's
+/// local dev server (`server -dir <dir>`) at `dir` and it'll pick up the
+/// generated .flw the same way it'd pick one up from S3.
+pub fn flowFileFromLocalPair(alloc: std.mem.Allocator, dir: []const u8, prev_id: []const u8, next_id: []const u8, out_dir: []const u8) !void {
+    const prev_path = try std.fmt.allocPrint(alloc, "{s}/{s}.rad", .{ std.mem.trimEnd(u8, dir, "/"), prev_id });
+    defer alloc.free(prev_path);
+    const next_path = try std.fmt.allocPrint(alloc, "{s}/{s}.rad", .{ std.mem.trimEnd(u8, dir, "/"), next_id });
+    defer alloc.free(next_path);
+
+    const prev_raw = try gdal.vsiRead(alloc, prev_path) orelse return error.PrevRadNotFound;
+    const prev_rad = try manifest.gunzipIfNeeded(alloc, prev_raw); // owns prev_raw
+    defer alloc.free(prev_rad);
+    const next_raw = try gdal.vsiRead(alloc, next_path) orelse return error.NextRadNotFound;
+    const next_rad = try manifest.gunzipIfNeeded(alloc, next_raw); // owns next_raw
+    defer alloc.free(next_rad);
+
+    const recOf = struct {
+        fn rec(bytes: []const u8, h: radcore.store.RadHeader) radcore.ZCRadFile {
+            return .{
+                .geo_tran = h.geo_tran,
+                .max_x = h.max_x,
+                .max_y = h.max_y,
+                .original_size = h.original_size,
+                .compressed = bytes.ptr + h.stream_off,
+                .compressed_len = h.stream_len,
+                .rle_version = h.rle_version,
+            };
+        }
+    }.rec;
+    const ph = radcore.store.parseRadHeader(prev_rad) orelse return error.BadPreviousRad;
+    const nh = radcore.store.parseRadHeader(next_rad) orelse return error.BadNextRad;
+
+    const flw = try radcore.flow_file.flowFileForPair(
+        alloc,
+        recOf(prev_rad, ph),
+        ph.time,
+        recOf(next_rad, nh),
+        nh.time,
+        FLOW_LOD,
+        radcore.flow_file.DEFAULT_VEC_SCALE,
+        FLOW_SEARCH,
+    );
+    defer alloc.free(flw);
+    const flw_path = try std.fmt.allocPrint(alloc, "{s}/{s}.flw", .{ std.mem.trimEnd(u8, out_dir, "/"), next_id });
+    defer alloc.free(flw_path);
+    try gdal.vsiWrite(alloc, flw_path, flw);
+    std.log.info("flow (local pair) {s}.flw: {d} B, lod {d} search {d}", .{ next_id, flw.len, FLOW_LOD, FLOW_SEARCH });
 }
 
 /// application/x-www-form-urlencoded decode (S3 event keys): '+' -> space,

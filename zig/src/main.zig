@@ -46,10 +46,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     if (handler.getenv("AWS_LAMBDA_RUNTIME_API")) |api| {
         // Store gzipped bodies with Content-Encoding metadata (RAD_GZIP=0 opts out).
+        //
+        // Guarded on RAD_OUTPUT being present: the TILE function is the same
+        // image with no output dir at all (it only reads, via RAD_TILES_ROOT),
+        // and an unconditional outputDir() here killed it at init with
+        // `error.MissingRadOutput` before it served a single request. A
+        // producer that is genuinely missing RAD_OUTPUT still fails loudly —
+        // at the write, inside handleEvent, where the error names the record.
         const gz = handler.getenv("RAD_GZIP") orelse "1";
         if (!std.mem.eql(u8, gz, "0")) {
-            handler.gzip_output = true;
-            try gdal.markPrefixGzip(alloc, try handler.outputDir());
+            if (handler.getenv("RAD_OUTPUT") != null) {
+                handler.gzip_output = true;
+                try gdal.markPrefixGzip(alloc, try handler.outputDir());
+            }
         }
         return runtime.run(alloc, api);
     }
@@ -61,9 +70,26 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     const input = maybe_input orelse {
         std.debug.print("Usage: rad_lambda <grib(.gz) | dir> [out_dir]\n" ++
-            "       rad_lambda --obs <obs.parquet> [out_dir]\n", .{});
+            "       rad_lambda --obs <obs.parquet> [out_dir]\n" ++
+            "       rad_lambda --flow <rad_dir> <prev_id> <next_id> [out_dir]\n", .{});
         std.process.exit(1);
     };
+
+    // Local dev/QA: regenerate one .flw from two EXISTING .rad files, using
+    // today's production FLOW_LOD/FLOW_SEARCH — a visual check before
+    // deploying a tuning change (see handler.flowFileFromLocalPair). Point
+    // raydare's local dev server at <out_dir> and it'll serve the result.
+    if (std.mem.eql(u8, input, "--flow")) {
+        const rad_dir = maybe_out orelse {
+            std.debug.print("Usage: rad_lambda --flow <rad_dir> <prev_id> <next_id> [out_dir]\n", .{});
+            std.process.exit(1);
+        };
+        const prev_id = args_it.next() orelse std.process.exit(1);
+        const next_id = args_it.next() orelse std.process.exit(1);
+        const out_dir = args_it.next() orelse rad_dir;
+        try handler.flowFileFromLocalPair(alloc, rad_dir, prev_id, next_id, out_dir);
+        return;
+    }
 
     // Observation surface (H3 parquet) -> obs/<variable>/ products. CLI-only
     // for now; the S3 trigger for .parquet keys is a later hook in handleEvent.

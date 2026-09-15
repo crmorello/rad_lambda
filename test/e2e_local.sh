@@ -23,7 +23,7 @@ RIE_CACHE=test/.cache
 WORK=$(mktemp -d /tmp/radlambda-e2e.XXXXXX)
 
 cleanup() {
-  docker rm -f "$MINIO" "$LAMBDA" "$OBSFN" >/dev/null 2>&1 || true
+  docker rm -f "$MINIO" "$LAMBDA" "$OBSFN" radlambda-e2e-tiles >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
@@ -227,6 +227,28 @@ echo "$T2" | grep -q "\"Location\":\"/tiles/v1/rads/$ON_STAMP/5/7/12.png\"" || f
 T3=$(invoke "$(http_event "/tiles/v1/nope/$ON_STAMP/5/7/12.png")")
 echo "$T3" | grep -q '"statusCode":404' || fail "unknown product was not a 404"
 T4=$(invoke "$(http_event "/tiles/v1/rads/timerange")")
-echo "$T4" | grep -q '"timestamps":\[' || fail "timerange shape"
+# respond() JSON-escapes the body, so the payload reads \"timestamps\":[ .
+echo "$T4" | grep -q '\\"timestamps\\":\[' || fail "timerange shape"
 
-echo "E2E PASS: radar + skip + gzip metadata + manifest + byte parity + obs + warm reuse + prefix filter + tiles"
+# --- 9: the tile function in ITS OWN configuration -------------------------
+# deploy/08-tiles.sh sets RAD_TILES_ROOT only — no RAD_OUTPUT, because the tile
+# function never writes. Cases 1-8 all ran against the ingest container, which
+# sets RAD_OUTPUT, so they could not catch an init that requires it. This runs
+# the container the way the deploy script actually configures it.
+TILEFN=radlambda-e2e-tiles
+docker run -d --rm --name "$TILEFN" --network "$NET" -p 9082:8080 \
+  -v "$(pwd)/$RIE:/rie:ro" --entrypoint /rie \
+  -e AWS_ACCESS_KEY_ID=e2e -e AWS_SECRET_ACCESS_KEY=e2esecret \
+  -e AWS_S3_ENDPOINT="$MINIO:9000" -e AWS_HTTPS=NO -e AWS_VIRTUAL_HOSTING=FALSE \
+  -e RAD_TILES_ROOT=/vsis3/rad-output -e RAD_TILES_CACHE_MB=384 \
+  "$IMAGE" /var/runtime/bootstrap >/dev/null
+sleep 3
+T5=$(curl -sf -XPOST http://localhost:9082/2015-03-31/functions/function/invocations \
+  -d "$(printf '{"rawPath":"/tiles/v1/rads/%s/5/7/12.png","queryStringParameters":{}}' "$ON_STAMP")")
+echo "tiles-only -> $(echo "$T5" | cut -c1-90)..."
+docker logs "$TILEFN" 2>&1 | grep -q "MissingRadOutput" \
+  && fail "tile function needs RAD_OUTPUT to start — it has no output dir"
+echo "$T5" | grep -q '"statusCode":200' || fail "tiles-only container did not serve a tile"
+docker rm -f "$TILEFN" >/dev/null 2>&1
+
+echo "E2E PASS: radar + skip + gzip metadata + manifest + byte parity + obs + warm reuse + prefix filter + tiles + tiles-only"
