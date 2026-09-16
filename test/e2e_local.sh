@@ -251,4 +251,64 @@ docker logs "$TILEFN" 2>&1 | grep -q "MissingRadOutput" \
 echo "$T5" | grep -q '"statusCode":200' || fail "tiles-only container did not serve a tile"
 docker rm -f "$TILEFN" >/dev/null 2>&1
 
-echo "E2E PASS: radar + skip + gzip metadata + manifest + byte parity + obs + warm reuse + prefix filter + tiles + tiles-only"
+# --- 10: 5-minute tile fills ------------------------------------------------
+# MRMS publishes every 2 min; the tile timeline wants :00,:05,:10,… The :00/:10
+# frames stay the 10-minute series in rads/ (written ONCE). The in-between slot
+# comes from :04, or :06 as a fallback, relabelled to :05 and written to
+# rads/5min/. The local grib set is 10-minute only, and the handler takes the
+# stamp from the FILENAME, so synthesize the sources by copying.
+FILL_SRC=$(echo "$ON_NAME" | sed -E 's/-[0-9]{6}\.grib2\.gz$/-010400.grib2.gz/')
+FILL_SIX=$(echo "$ON_NAME" | sed -E 's/-[0-9]{6}\.grib2\.gz$/-010600.grib2.gz/')
+FILL_TWO=$(echo "$ON_NAME" | sed -E 's/-[0-9]{6}\.grib2\.gz$/-010200.grib2.gz/')
+for n in "$FILL_SRC" "$FILL_SIX" "$FILL_TWO"; do
+  docker exec "$MINIO" mc cp /tmp/on.gz "local/noaa-mrms-pds/CONUS/SeamlessHSR_00.00/$n" >/dev/null
+done
+
+R10=$(invoke "$(event "$FILL_SRC")")
+echo ":04 -> $R10"
+echo "$R10" | grep -q '"processed":\["/vsis3/rad-output/rads/5min/20260712-010500.rad"\]' \
+  || fail ":04 did not produce the 20260712-010500 fill"
+
+# The relabel must reach the RAD header, not just the filename.
+docker exec "$MINIO" mc cat local/rad-output/rads/5min/20260712-010500.rad > "$WORK/fill.gz"
+gunzip -c "$WORK/fill.gz" > "$WORK/fill.rad" || fail "fill is not gzipped at rest"
+python3 - "$WORK/fill.rad" <<'PYEOF'
+import struct, sys, datetime
+d = open(sys.argv[1], 'rb').read()
+assert d[:4] in (b'RAD2', b'RAD3'), d[:4]
+t = datetime.datetime.fromtimestamp(struct.unpack('<q', d[4:12])[0] / 1000, datetime.timezone.utc)
+assert t.strftime('%Y%m%d-%H%M%S') == '20260712-010500', f'header time is {t}, want 20260712-010500'
+print("    header time relabelled to 20260712-010500")
+PYEOF
+
+# The 10-minute series must be untouched: no new object, no new manifest entry.
+docker exec "$MINIO" mc ls local/rad-output/rads/ | grep -q "20260712-010500.rad" \
+  && fail "a 5-minute fill leaked into rads/"
+docker exec "$MINIO" mc cat local/rad-output/rads/manifest.json > "$WORK/m10.gz"
+gunzip -c "$WORK/m10.gz" > "$WORK/m10.json"
+grep -q "010500" "$WORK/m10.json" && fail "5-minute fill leaked into the 10-minute manifest"
+
+# The tile timeline interleaves both prefixes without duplicating either.
+docker exec "$MINIO" mc cat local/rad-output/rads/5min/manifest.json > "$WORK/m5.gz"
+gunzip -c "$WORK/m5.gz" > "$WORK/m5.json"
+grep -q '"url":"/rads/5min/20260712-010500.rad"' "$WORK/m5.json" || fail "merged manifest missing the fill url"
+grep -q "\"url\":\"/rads/$ON_STAMP.rad\"" "$WORK/m5.json" || fail "merged manifest missing the 10-minute url"
+
+# :06 must yield to the :04 that already filled the slot.
+R10B=$(invoke "$(event "$FILL_SIX")")
+echo ":06 (slot filled) -> $R10B"
+echo "$R10B" | grep -q '"processed":\[\],"skipped":1' || fail ":06 overwrote a slot :04 had already filled"
+
+# ...but must fill it when :04 never landed.
+docker exec "$MINIO" mc rm local/rad-output/rads/5min/20260712-010500.rad >/dev/null
+R10C=$(invoke "$(event "$FILL_SIX")")
+echo ":06 (slot empty)  -> $R10C"
+echo "$R10C" | grep -q '"processed":\["/vsis3/rad-output/rads/5min/20260712-010500.rad"\]' \
+  || fail ":06 did not fill an empty slot"
+
+# :02 is never a source.
+R10D=$(invoke "$(event "$FILL_TWO")")
+echo ":02 -> $R10D"
+echo "$R10D" | grep -q '"processed":\[\],"skipped":1' || fail ":02 should never produce a fill"
+
+echo "E2E PASS: radar + skip + gzip metadata + manifest + byte parity + obs + warm reuse + prefix filter + tiles + tiles-only + 5-min fills"

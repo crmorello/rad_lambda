@@ -231,6 +231,22 @@ pub fn isDir(alloc: std.mem.Allocator, path: []const u8) bool {
     return true;
 }
 
+/// Is `name` present in `dir`? One directory listing, no object fetch —
+/// VSIStatL is unusable under cImport (see isDir) and vsiRead would pull the
+/// whole object down just to answer a yes/no. Clears the cached listing first:
+/// vsicurl caches misses, and this is asked about a key that was absent on the
+/// previous invocation precisely when the answer has just changed.
+pub fn dirHas(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) bool {
+    clearVsiCache(alloc, dir);
+    const entries = readDirEntries(alloc, dir) catch return false;
+    defer {
+        for (entries) |e| alloc.free(e.name);
+        alloc.free(entries);
+    }
+    for (entries) |e| if (std.mem.eql(u8, e.name, name)) return true;
+    return false;
+}
+
 /// Registers Content-Encoding on all writes under `prefix` (S3 PUT headers
 /// ride GDAL_HTTP_HEADERS; per-path so reads elsewhere are untouched).
 /// Everything written under the prefix MUST then be gzipped.
@@ -253,4 +269,37 @@ pub fn markBucketUnsigned(alloc: std.mem.Allocator, bucket: []const u8) !void {
     const prefix = try std.fmt.allocPrintSentinel(alloc, "/vsis3/{s}", .{bucket}, 0);
     defer alloc.free(prefix);
     c.VSISetPathSpecificOption(prefix.ptr, "AWS_NO_SIGN_REQUEST", "YES");
+}
+
+test "readDirEntries does not recurse into subdirectories" {
+    // Load-bearing for the 5-minute tile series: the in-between frames live at
+    // rads/5min/, and the 10-minute manifest is built by listing rads/. A
+    // recursive listing would silently pull the 5-minute frames into the
+    // 10-minute manifest that .rad clients read.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/rads", .{tmp.sub_path});
+    defer alloc.free(root);
+
+    const top = try std.fmt.allocPrint(alloc, "{s}/20260712-011000.rad", .{root});
+    defer alloc.free(top);
+    const nested = try std.fmt.allocPrint(alloc, "{s}/5min/20260712-010500.rad", .{root});
+    defer alloc.free(nested);
+    try vsiWrite(alloc, top, "RAD3xxxx");   // vsiWrite mkdir -p's non-/vsi paths
+    try vsiWrite(alloc, nested, "RAD3xxxx");
+
+    const entries = try readDirEntries(alloc, root);
+    defer {
+        for (entries) |e| alloc.free(e.name);
+        alloc.free(entries);
+    }
+    var saw_top = false;
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.name, "20260712-011000.rad")) saw_top = true;
+        // Neither a bare basename nor a relative path from the nested dir.
+        try std.testing.expect(!std.mem.eql(u8, e.name, "20260712-010500.rad"));
+        try std.testing.expect(std.mem.indexOfScalar(u8, e.name, '/') == null);
+    }
+    try std.testing.expect(saw_top);
 }

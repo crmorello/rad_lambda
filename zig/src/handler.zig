@@ -34,14 +34,14 @@ pub var flow_enabled = true;
 /// vs 79-89% at lod 2) — the finer grid is noisier per block without a
 /// compensating change to the diffusion-fill pass count.
 ///
-/// RE-TESTING at lod=1 again (2026-09-14, local only, NOT deployed) for a
-/// new, distinct symptom: visible warping/ghosting where a 78km node covers
-/// an area with sharply non-uniform motion (rotation, a fast cell embedded
-/// in slower stratiform rain) and the coarse vector gets bilinearly smeared
-/// across the whole cell. Finer nodes may trade the earlier-measured
-/// keyframe/noise cost for less per-cell motion averaging — that tradeoff
-/// hasn't been measured for THIS symptom yet. Revert to 2 if it doesn't
-/// help or reintroduces the keyframe symptom.
+/// lod=1 was re-adopted and DEPLOYED on 2026-09-16 for a different symptom
+/// than the one that caused the earlier revert: visible warping/ghosting
+/// where a 78 km node covers sharply non-uniform motion (rotation, a fast
+/// cell embedded in slower stratiform rain) and the coarse vector gets
+/// bilinearly smeared across the whole cell. The trade against the
+/// keyframe/noise cost measured above has NOT been re-measured at lod 1 with
+/// FLOW_SEARCH=20 — watch for the crossfade/keyframing symptom returning and
+/// revert to 2 if it does.
 pub const FLOW_LOD: u32 = 1;
 /// Block-match search radius in texels, INDEPENDENT of FLOW_LOD (see
 /// flow.zig's estimateSearch — a lambda-only knob; the client's synchronous
@@ -123,13 +123,13 @@ pub fn urlPrefix(alloc: std.mem.Allocator) ![]const u8 {
     return try alloc.dupe(u8, "");
 }
 
-/// One raster in, one RAD out. Returns the written path (caller frees).
-pub fn processFile(alloc: std.mem.Allocator, input: []const u8, out_dir: []const u8, res: f64, id_prefix: []const u8) ![]const u8 {
-    const s = stamp.fromFilename(std.fs.path.basename(input)) orelse return error.NoTimestampInFilename;
+const Encoded = struct { rad: []u8, path: []const u8 };
 
-    const warped = try gdal.warpBand(alloc, input, res);
-    defer alloc.free(warped.band);
-
+/// Encode a warped band AT `s` and write it to `{out_dir}/{id_prefix}{s}.rad`.
+/// Split out of processFile because the 5-minute tile slots need the same
+/// encode+write under a DIFFERENT stamp than the source grib carries.
+/// Caller frees both fields.
+fn encodeAndWrite(alloc: std.mem.Allocator, warped: gdal.Warped, s: stamp.Stamp, out_dir: []const u8, id_prefix: []const u8) !Encoded {
     // RAD3 (paged best-of stream) for radar too — CONUS 0.79 → 0.55 MB,
     // Alaska 0.31 → 0.13 MB, and page-addressable decode in the clients.
     // RAD_RAD3=0 keeps RAD2 (every client decodes both).
@@ -137,7 +137,7 @@ pub fn processFile(alloc: std.mem.Allocator, input: []const u8, out_dir: []const
         try radcore.rad3.writeRadV3(alloc, s.ms(), warped.geo_tran, warped.max_x, warped.max_y, warped.no_data, warped.band)
     else
         try radcore.writeRadV2(alloc, s.ms(), warped.geo_tran, warped.max_x, warped.max_y, warped.no_data, warped.band);
-    defer alloc.free(rad);
+    errdefer alloc.free(rad);
     std.log.info("{s}{s}: {d} bytes ({s})", .{ id_prefix, s.slice(), rad.len, rad[0..4] });
     const body = if (gzip_output) try manifest.gzipBytes(alloc, rad) else rad;
     defer if (gzip_output) alloc.free(body);
@@ -147,15 +147,79 @@ pub fn processFile(alloc: std.mem.Allocator, input: []const u8, out_dir: []const
     });
     errdefer alloc.free(out_path);
     try gdal.vsiWrite(alloc, out_path, body);
+    return .{ .rad = rad, .path = out_path };
+}
+
+/// One raster in, one RAD out. Returns the written path (caller frees).
+pub fn processFile(alloc: std.mem.Allocator, input: []const u8, out_dir: []const u8, res: f64, id_prefix: []const u8) ![]const u8 {
+    const s = stamp.fromFilename(std.fs.path.basename(input)) orelse return error.NoTimestampInFilename;
+
+    const warped = try gdal.warpBand(alloc, input, res);
+    defer alloc.free(warped.band);
+
+    const w = try encodeAndWrite(alloc, warped, s, out_dir, id_prefix);
+    defer alloc.free(w.rad);
 
     // Best-effort flow sidecar for the pair ending at this frame — never
     // fails the ingest (flow is a derivation, regenerable at any time).
     if (flow_enabled) {
-        flowSidecar(alloc, out_dir, id_prefix, s, rad) catch |err| {
+        flowSidecar(alloc, out_dir, id_prefix, s, w.rad) catch |err| {
             std.log.warn("flow sidecar skipped for {s}{s}: {s}", .{ id_prefix, s.slice(), @errorName(err) });
         };
     }
-    return out_path;
+    return w.path;
+}
+
+/// Same warp, written under `target` instead of the source grib's own stamp —
+/// the 5-minute tile slots, sourced from the :04 frame (or :06 as a fallback).
+///
+/// No flow sidecar: tiles never read .flw, and flowSidecar looks back a
+/// hard-coded SLICE_INTERVAL_MS (10 min), which is wrong for this series.
+/// Returns null when `if_absent` and the slot is already filled — that is how
+/// the :06 fallback yields to a :04 that already landed, without tracking which
+/// minute produced each slot.
+fn processRelabelled(alloc: std.mem.Allocator, input: []const u8, out_dir: []const u8, res: f64, id_prefix: []const u8, target: stamp.Stamp, if_absent: bool) !?[]const u8 {
+    if (if_absent) {
+        const name = try std.fmt.allocPrint(alloc, "{s}{s}.rad", .{ id_prefix, target.slice() });
+        defer alloc.free(name);
+        if (gdal.dirHas(alloc, std.mem.trimEnd(u8, out_dir, "/"), name)) {
+            std.log.info("5-min slot {s}{s} already filled; :06 yields", .{ id_prefix, target.slice() });
+            return null;
+        }
+    }
+    const warped = try gdal.warpBand(alloc, input, res);
+    defer alloc.free(warped.band);
+    const w = try encodeAndWrite(alloc, warped, target, out_dir, id_prefix);
+    alloc.free(w.rad);
+    return w.path;
+}
+
+/// Which slot of the tile timeline an MRMS stamp feeds.
+///
+/// MRMS publishes every 2 minutes; the tile timeline wants :00,:05,:10,:15,…
+/// The :00/:10 frames ARE the 10-minute series and are written once to rads/.
+/// The in-between slots come from :04 (1 min early) or :06 as a fallback when
+/// :04 never landed. :02 is deliberately unusable: it arrives BEFORE :04, so
+/// honouring the preference would need a delayed write or per-slot source
+/// tracking, and 3 minutes of drift is too much to relabel as :05.
+/// Where the 5-minute in-between frames live: a subdirectory of the radar
+/// output, so it inherits the bucket lifecycle rule on rads/ and — because
+/// gdal.readDirEntries lists one level only — cannot leak into the 10-minute
+/// manifest built by listing rads/.
+fn fiveMinDir(alloc: std.mem.Allocator, out_dir: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(alloc, "{s}/5min", .{std.mem.trimEnd(u8, out_dir, "/")});
+}
+
+pub const Slot = enum { ten_minute, fill, fill_fallback, none };
+
+pub fn slotFor(s: *const stamp.Stamp) Slot {
+    if (s.text[13] != '0' or s.text[14] != '0') return .none; // seconds must be :00
+    return switch (s.text[12]) { // units digit of the minute
+        '0' => .ten_minute,
+        '4' => .fill,
+        '6' => .fill_fallback,
+        else => .none,
+    };
 }
 
 /// Write "{prefix}{stamp}.flw" for the pair (stamp - 10 min) -> stamp: read
@@ -426,6 +490,7 @@ pub fn handleEvent(arena: std.mem.Allocator, event_json: []const u8) ![]const u8
     var outputs: std.ArrayList([]const u8) = .empty;
     var skipped: usize = 0;
     var radar_written = false;
+    var fill_written = false;
     for (records.items) |record| {
         const s3 = record.object.get("s3").?.object;
         const bucket = s3.get("bucket").?.object.get("name").?.string;
@@ -459,13 +524,33 @@ pub fn handleEvent(arena: std.mem.Allocator, event_json: []const u8) ![]const u8
                     skipped += 1;
                     continue;
                 };
-                if (!s.onSliceGrid()) {
+                const slot = slotFor(&s);
+                if (slot == .none) {
                     skipped += 1;
                     continue;
                 }
                 const prefix = try regionPrefix(arena, key);
-                try outputs.append(arena, try processFile(arena, input, try outputDir(), resolution(), prefix));
-                radar_written = true;
+                const out = try outputDir();
+                if (slot == .ten_minute) {
+                    // Unchanged: ONE write to rads/, and the 10-minute manifest
+                    // that .rad clients read stays exactly as it was.
+                    try outputs.append(arena, try processFile(arena, input, out, resolution(), prefix));
+                    radar_written = true;
+                } else {
+                    // :04 -> +1 min, :06 -> -1 min; both land on the :05 slot.
+                    const delta: i64 = if (slot == .fill) std.time.ms_per_min else -std.time.ms_per_min;
+                    const target = stamp.fromMs(s.ms() + delta) orelse {
+                        skipped += 1;
+                        continue;
+                    };
+                    const five = try fiveMinDir(arena, out);
+                    if (try processRelabelled(arena, input, five, resolution(), prefix, target, slot == .fill_fallback)) |path| {
+                        try outputs.append(arena, path);
+                        fill_written = true;
+                    } else {
+                        skipped += 1;
+                    }
+                }
             },
             // No slice-grid gate (obs issuances sit off the 10-minute lattice
             // — the epoch sample is 20:55:00) and no region prefix (H3 is
@@ -488,6 +573,19 @@ pub fn handleEvent(arena: std.mem.Allocator, event_json: []const u8) ![]const u8
     if (radar_written) {
         const prefix = try urlPrefix(arena);
         try manifest.rebuild(arena, try outputDir(), prefix, "reflectivity", gzip_output, manifestWindowMs());
+    }
+    // The TILE timeline: one manifest interleaving the 10-minute frames in
+    // rads/ with the 5-minute in-betweens in rads/5min/, neither copied.
+    if (radar_written or fill_written) {
+        const out = std.mem.trimEnd(u8, try outputDir(), "/");
+        const up = try urlPrefix(arena);
+        const five = try fiveMinDir(arena, out);
+        const five_up = try std.fmt.allocPrint(arena, "{s}/5min", .{up});
+        const out_path = try std.fmt.allocPrint(arena, "{s}/manifest.json", .{five});
+        try manifest.rebuildFrom(arena, out_path, &.{
+            .{ .dir = out, .url_prefix = up },
+            .{ .dir = five, .url_prefix = five_up },
+        }, "reflectivity", gzip_output, manifestWindowMs());
     }
 
     var response: std.Io.Writer.Allocating = .init(arena);
@@ -598,4 +696,60 @@ test "prefixAllowed: RAD_KEY_PREFIXES narrows an over-broad trigger" {
     // An empty or whitespace-only value must not accidentally allow everything.
     try std.testing.expect(!prefixAllowed("gcc/output/x.parquet", ""));
     try std.testing.expect(!prefixAllowed("gcc/output/x.parquet", " , "));
+}
+
+test "slotFor: which MRMS minutes feed the tile timeline" {
+    const mk = struct {
+        fn s(text: *const [15]u8) stamp.Stamp {
+            var out: stamp.Stamp = undefined;
+            @memcpy(&out.text, text);
+            return out;
+        }
+    }.s;
+    // :00 and :10 ARE the 10-minute series — written once to rads/.
+    try std.testing.expectEqual(Slot.ten_minute, slotFor(&mk("20260712-010000")));
+    try std.testing.expectEqual(Slot.ten_minute, slotFor(&mk("20260712-011000")));
+    try std.testing.expectEqual(Slot.ten_minute, slotFor(&mk("20260712-012000")));
+    // :04 is the preferred source for the in-between slot, :06 the fallback.
+    try std.testing.expectEqual(Slot.fill, slotFor(&mk("20260712-010400")));
+    try std.testing.expectEqual(Slot.fill, slotFor(&mk("20260712-011400")));
+    try std.testing.expectEqual(Slot.fill_fallback, slotFor(&mk("20260712-010600")));
+    try std.testing.expectEqual(Slot.fill_fallback, slotFor(&mk("20260712-012600")));
+    // :02 and :08 are dropped — see the doc comment on Slot.
+    try std.testing.expectEqual(Slot.none, slotFor(&mk("20260712-010200")));
+    try std.testing.expectEqual(Slot.none, slotFor(&mk("20260712-010800")));
+    // Odd minutes never appear in MRMS, but must not classify as anything.
+    try std.testing.expectEqual(Slot.none, slotFor(&mk("20260712-010500")));
+    // Seconds must be :00 — a sub-minute stamp is not a slice.
+    try std.testing.expectEqual(Slot.none, slotFor(&mk("20260712-010030")));
+    try std.testing.expectEqual(Slot.none, slotFor(&mk("20260712-010401")));
+}
+
+test "5-minute relabel: :04 and :06 both land on the same :05 slot" {
+    const mk = struct {
+        fn s(text: *const [15]u8) stamp.Stamp {
+            var out: stamp.Stamp = undefined;
+            @memcpy(&out.text, text);
+            return out;
+        }
+    }.s;
+    const four = mk("20260712-010400");
+    const six = mk("20260712-010600");
+    const from_four = stamp.fromMs(four.ms() + std.time.ms_per_min).?;
+    const from_six = stamp.fromMs(six.ms() - std.time.ms_per_min).?;
+    try std.testing.expectEqualStrings("20260712-010500", from_four.slice());
+    try std.testing.expectEqualStrings("20260712-010500", from_six.slice());
+
+    // Hour and day rollover, since the relabel is plain ms arithmetic.
+    try std.testing.expectEqualStrings(
+        "20260712-020500",
+        stamp.fromMs(mk("20260712-020400").ms() + std.time.ms_per_min).?.slice(),
+    );
+    try std.testing.expectEqualStrings(
+        "20260713-000500",
+        stamp.fromMs(mk("20260713-000400").ms() + std.time.ms_per_min).?.slice(),
+    );
+    // A relabelled id still passes the manifest's id filter, region prefix and all.
+    try std.testing.expect(stamp.validId("20260712-010500"));
+    try std.testing.expect(stamp.validId("alaska_20260712-010500"));
 }

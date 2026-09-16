@@ -10,6 +10,11 @@ const gdal = @import("gdal.zig");
 pub const Frame = struct {
     id: []const u8,
     bytes: u64,
+    /// Overrides the manifest-wide prefix for this frame. The radar TILE
+    /// timeline interleaves the 10-minute frames in rads/ with the 5-minute
+    /// in-betweens in rads/5min/, and neither set is duplicated on disk — so
+    /// one manifest has to carry urls from two prefixes.
+    url_prefix: ?[]const u8 = null,
 };
 
 fn frameLessThan(_: void, a: Frame, b: Frame) bool {
@@ -45,7 +50,7 @@ pub fn build(alloc: std.mem.Allocator, frames: []Frame, url_prefix: []const u8, 
         var s: stamp.Stamp = undefined;
         @memcpy(&s.text, stamp.stampOfId(frame.id)[0..15]);
         try w.print("{{\"id\":\"{s}\",\"time\":\"{s}\",\"url\":\"{s}/{s}.rad\",\"bytes\":{d}}}", .{
-            frame.id, &s.rfc3339(), url_prefix, frame.id, frame.bytes,
+            frame.id, &s.rfc3339(), frame.url_prefix orelse url_prefix, frame.id, frame.bytes,
         });
     }
     try w.writeAll("]}");
@@ -67,34 +72,58 @@ pub fn frameFresh(id: []const u8, now_ms: i64, window_ms: i64) bool {
 /// they just leave the timeline the client sees.
 pub fn rebuild(alloc: std.mem.Allocator, out_dir: []const u8, url_prefix: []const u8, product: []const u8, gzip: bool, window_ms: i64) !void {
     const dir = std.mem.trimEnd(u8, out_dir, "/");
-    // vsicurl caches directory listings per process; a warm container would
-    // otherwise rebuild from the frame set it saw at first listing, forever.
-    gdal.clearVsiCache(alloc, dir);
-    const entries = try gdal.readDirEntries(alloc, dir);
-    defer {
-        for (entries) |e| alloc.free(e.name);
-        alloc.free(entries);
-    }
+    const path = try std.fmt.allocPrint(alloc, "{s}/manifest.json", .{dir});
+    defer alloc.free(path);
+    try rebuildFrom(alloc, path, &.{.{ .dir = dir, .url_prefix = url_prefix }}, product, gzip, window_ms);
+}
 
+/// One prefix contributing frames to a manifest.
+pub const Source = struct { dir: []const u8, url_prefix: []const u8 };
+
+/// Rebuild from SEVERAL prefixes into an explicit path. `rebuild` is the
+/// one-source case; the radar tile timeline is the two-source case, drawing
+/// 10-minute frames from rads/ and 5-minute ones from rads/5min/ without
+/// copying either. Frames are sorted by `build`, so sources may be listed in
+/// any order and still interleave correctly by stamp.
+pub fn rebuildFrom(alloc: std.mem.Allocator, out_path: []const u8, sources: []const Source, product: []const u8, gzip: bool, window_ms: i64) !void {
     const now_ms = @as(i64, gdal.c.time(null)) * 1000;
     var frames: std.ArrayList(Frame) = .empty;
     defer frames.deinit(alloc);
-    for (entries) |entry| {
-        if (!std.mem.endsWith(u8, entry.name, ".rad")) continue;
-        const id = entry.name[0 .. entry.name.len - 4];
-        if (!stamp.validId(id)) continue;
-        if (!frameFresh(id, now_ms, window_ms)) continue;
-        try frames.append(alloc, .{ .id = id, .bytes = entry.size });
+
+    var owned: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (owned.items) |n| alloc.free(n);
+        owned.deinit(alloc);
     }
 
-    const json = try build(alloc, frames.items, url_prefix, product);
+    for (sources) |src| {
+        const dir = std.mem.trimEnd(u8, src.dir, "/");
+        // vsicurl caches directory listings per process; a warm container would
+        // otherwise rebuild from the frame set it saw at first listing, forever.
+        gdal.clearVsiCache(alloc, dir);
+        const entries = try gdal.readDirEntries(alloc, dir);
+        defer alloc.free(entries);
+        for (entries) |entry| {
+            if (!std.mem.endsWith(u8, entry.name, ".rad")) {
+                alloc.free(entry.name);
+                continue;
+            }
+            const id = entry.name[0 .. entry.name.len - 4];
+            if (!stamp.validId(id) or !frameFresh(id, now_ms, window_ms)) {
+                alloc.free(entry.name);
+                continue;
+            }
+            // entry.name outlives the loop: `id` borrows it and `build` reads it.
+            try owned.append(alloc, entry.name);
+            try frames.append(alloc, .{ .id = id, .bytes = entry.size, .url_prefix = src.url_prefix });
+        }
+    }
+
+    const json = try build(alloc, frames.items, sources[0].url_prefix, product);
     defer alloc.free(json);
     const body = if (gzip) try gzipBytes(alloc, json) else json;
     defer if (gzip) alloc.free(body);
-
-    const path = try std.fmt.allocPrint(alloc, "{s}/manifest.json", .{dir});
-    defer alloc.free(path);
-    try gdal.vsiWrite(alloc, path, body);
+    try gdal.vsiWrite(alloc, out_path, body);
 }
 
 /// Gzip in memory (transport compression at rest: stored gzipped with
@@ -191,4 +220,36 @@ test "gzip round trip" {
     var out: [original.len]u8 = undefined;
     try decompress.reader.readSliceAll(&out);
     try std.testing.expectEqualStrings(original, &out);
+}
+
+test "build: per-frame url_prefix interleaves two prefixes in one manifest" {
+    const alloc = std.testing.allocator;
+    // The radar tile timeline: 10-minute frames served from /rads, the
+    // in-between slots from /rads/5min, sorted into one timeline by stamp.
+    var frames = [_]Frame{
+        .{ .id = "20260712-011000", .bytes = 500 },
+        .{ .id = "20260712-010500", .bytes = 400, .url_prefix = "/rads/5min" },
+        .{ .id = "20260712-011500", .bytes = 450, .url_prefix = "/rads/5min" },
+        .{ .id = "alaska_20260712-010500", .bytes = 90, .url_prefix = "/rads/5min" },
+        .{ .id = "20260712-010000", .bytes = 520 },
+    };
+    const json = try build(alloc, &frames, "/rads", "reflectivity");
+    defer alloc.free(json);
+
+    // Frames with no override keep the manifest-wide prefix...
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"url\":\"/rads/20260712-011000.rad\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"url\":\"/rads/20260712-010000.rad\"") != null);
+    // ...and the fills carry their own, region prefix included.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"url\":\"/rads/5min/20260712-010500.rad\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"url\":\"/rads/5min/alaska_20260712-010500.rad\"") != null);
+    // No fill leaked onto the 10-minute prefix.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"url\":\"/rads/20260712-010500.rad\"") == null);
+
+    // build() sorts, so sources may be listed in any order: the timeline must
+    // come out 0000, 0500, 0500(alaska), 1000, 1500 by stamp.
+    const at0 = std.mem.indexOf(u8, json, "20260712-010000").?;
+    const at5 = std.mem.indexOf(u8, json, "20260712-010500").?;
+    const at10 = std.mem.indexOf(u8, json, "20260712-011000").?;
+    const at15 = std.mem.indexOf(u8, json, "20260712-011500").?;
+    try std.testing.expect(at0 < at5 and at5 < at10 and at10 < at15);
 }

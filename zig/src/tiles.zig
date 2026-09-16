@@ -67,13 +67,25 @@ const CachedManifest = struct { product: []u8, text: []u8, at: i64 };
 var manifest_cache: std.ArrayList(CachedManifest) = .empty;
 const MANIFEST_TTL_S: i64 = 15;
 
+/// Where a product's TILE timeline lives, when it differs from the product id.
+///
+/// Radar tiles serve a 5-minute timeline assembled at rads/5min/manifest.json —
+/// it interleaves the 10-minute frames in rads/ with the in-between slots in
+/// rads/5min/, with per-frame urls, so nothing is duplicated on disk. Plain
+/// rads/manifest.json stays the 10-minute series that .rad clients read, and is
+/// untouched by this.
+fn manifestDir(product: []const u8) []const u8 {
+    if (std.mem.eql(u8, product, "rads")) return "rads/5min";
+    return product;
+}
+
 /// Manifest text for a product (15 s cache); null = no such product/manifest.
 fn manifestText(product: []const u8) !?[]const u8 {
     const now: i64 = @intCast(c.time(null));
     for (manifest_cache.items) |*e| {
         if (std.mem.eql(u8, e.product, product)) {
             if (now - e.at < MANIFEST_TTL_S) return e.text;
-            const path = try std.fmt.allocPrint(persistent, "{s}/{s}/manifest.json", .{ try root(), product });
+            const path = try std.fmt.allocPrint(persistent, "{s}/{s}/manifest.json", .{ try root(), manifestDir(product) });
             defer persistent.free(path);
             gdal.clearVsiCache(persistent, path);
             const raw = (try gdal.vsiRead(persistent, path)) orelse return null;
@@ -83,7 +95,7 @@ fn manifestText(product: []const u8) !?[]const u8 {
             return e.text;
         }
     }
-    const path = try std.fmt.allocPrint(persistent, "{s}/{s}/manifest.json", .{ try root(), product });
+    const path = try std.fmt.allocPrint(persistent, "{s}/{s}/manifest.json", .{ try root(), manifestDir(product) });
     defer persistent.free(path);
     const raw = (try gdal.vsiRead(persistent, path)) orelse return null;
     const text = try manifest.gunzipIfNeeded(persistent, raw);
@@ -162,16 +174,54 @@ pub fn render(arena: std.mem.Allocator, req: Request) !?Rendered {
     return .{ .png = r.bytes, .empty = false, .frames = files.items.len };
 }
 
-/// Newest stamp in the product manifest (for `latest`).
+/// Newest stamp in the product manifest (for `latest`), preferring the newest
+/// stamp that has an UNPREFIXED frame.
+///
+/// Radar ids carry a region prefix (`alaska_`, `carib_`, `guam_`, `hawaii_`)
+/// and CONUS is deliberately bare (handler.regionPrefix) because it is the
+/// primary product. CONUS is also the largest grid and lands a slice behind the
+/// small regions, so taking the max over EVERY frame pointed `latest` at a
+/// stamp that had the four small regions and no CONUS — and the tile came back
+/// empty over the continental US. Measured live 2026-09-15: newest overall
+/// 20260915-165000, newest CONUS 20260915-164000.
+///
+/// Obs ids are never prefixed, so this is a no-op there. Falls back to the
+/// newest of any frame so a hypothetical all-prefixed product still resolves.
 fn newestStamp(arena: std.mem.Allocator, product: []const u8) !?[]const u8 {
     const text = (try manifestText(product)) orelse return null;
     const m = try parseManifest(arena, text);
-    var best: ?[]const u8 = null;
-    for (m.frames) |f| {
+    return pickNewest(m.frames);
+}
+
+/// The rule itself, split out so it is testable without fetching a manifest.
+fn pickNewest(frames: []const ManifestFrame) ?[]const u8 {
+    var best_primary: ?[]const u8 = null;
+    var best_any: ?[]const u8 = null;
+    for (frames) |f| {
         const s = stamp.stampOfId(f.id);
-        if (best == null or std.mem.order(u8, s, best.?) == .gt) best = s;
+        if (best_any == null or std.mem.order(u8, s, best_any.?) == .gt) best_any = s;
+        if (std.mem.indexOfScalar(u8, f.id, '_') == null) {
+            if (best_primary == null or std.mem.order(u8, s, best_primary.?) == .gt) best_primary = s;
+        }
     }
-    return best;
+    return best_primary orelse best_any;
+}
+
+/// Sorted, de-duplicated frame times — the timeline a client consumes.
+fn uniqueTimes(arena: std.mem.Allocator, frames: []const ManifestFrame) ![][]const u8 {
+    var times: std.ArrayList([]const u8) = .empty;
+    for (frames) |f| try times.append(arena, f.time);
+    std.mem.sort([]const u8, times.items, {}, strLess);
+    var out: std.ArrayList([]const u8) = .empty;
+    for (times.items, 0..) |t, i| {
+        if (i > 0 and std.mem.eql(u8, t, times.items[i - 1])) continue;
+        try out.append(arena, t);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn strLess(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
 }
 
 // ----------------------------------------------------------------- HTTP glue
@@ -253,11 +303,15 @@ pub fn handleHttp(arena: std.mem.Allocator, event: std.json.Value) ![]const u8 {
         if (radcore.products.indexOf(product) == null) return respond(arena, .{ .status = 404, .body = "unknown product" });
         const text = (try manifestText(product)) orelse return respond(arena, .{ .status = 404, .body = "no manifest" });
         const m = try parseManifest(arena, text);
+        // One entry per STAMP, not per frame: radar carries a frame per region
+        // for the same instant, so emitting f.time raw repeated every timestamp
+        // once per region and any client building a timeline got duplicates.
+        const times = try uniqueTimes(arena, m.frames);
         var aw: std.Io.Writer.Allocating = .init(arena);
         try aw.writer.writeAll("{\"timestamps\":[");
-        for (m.frames, 0..) |f, i| {
+        for (times, 0..) |t, i| {
             if (i > 0) try aw.writer.writeAll(",");
-            try aw.writer.print("\"{s}\"", .{f.time});
+            try aw.writer.print("\"{s}\"", .{t});
         }
         try aw.writer.writeAll("]}");
         return respond(arena, .{ .status = 200, .content_type = "application/json", .cache_control = "public, max-age=15", .body = try aw.toOwnedSlice() });
@@ -341,4 +395,66 @@ test "tiles: path parsing rejects garbage, respond() builds valid v2 JSON" {
     const png_resp = try respond(arena, .{ .status = 200, .content_type = "image/png", .body = "\x89PNG", .binary = true });
     try testing.expect(std.mem.indexOf(u8, png_resp, "\"isBase64Encoded\":true,\"body\":\"iVBORw==\"") != null);
     try testing.expect(isHttpEvent(bad) and !isHttpEvent(try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"Records\":[]}", .{})));
+}
+
+test "pickNewest: latest lands on a stamp that actually has the primary frame" {
+    // The live shape on 2026-09-15: CONUS (unprefixed) one 10-minute slice
+    // behind the four small regions. Taking the max over every frame chose
+    // 165000, which has no CONUS frame — an empty tile over the US.
+    const radar = [_]ManifestFrame{
+        .{ .id = "20260915-164000" },
+        .{ .id = "alaska_20260915-164000" },
+        .{ .id = "hawaii_20260915-164000" },
+        .{ .id = "alaska_20260915-165000" },
+        .{ .id = "carib_20260915-165000" },
+        .{ .id = "guam_20260915-165000" },
+        .{ .id = "hawaii_20260915-165000" },
+    };
+    try std.testing.expectEqualStrings("20260915-164000", pickNewest(&radar).?);
+
+    // Obs ids are never region-prefixed, so the newest is simply the newest.
+    const obs = [_]ManifestFrame{
+        .{ .id = "20260901-204500" },
+        .{ .id = "20260901-205500" },
+        .{ .id = "20260901-205000" },
+    };
+    try std.testing.expectEqualStrings("20260901-205500", pickNewest(&obs).?);
+
+    // Once CONUS catches up it wins again.
+    const caught_up = [_]ManifestFrame{
+        .{ .id = "20260915-164000" },
+        .{ .id = "alaska_20260915-165000" },
+        .{ .id = "20260915-165000" },
+    };
+    try std.testing.expectEqualStrings("20260915-165000", pickNewest(&caught_up).?);
+
+    // A hypothetical all-prefixed product still resolves rather than 404ing.
+    const all_prefixed = [_]ManifestFrame{
+        .{ .id = "alaska_20260915-164000" },
+        .{ .id = "alaska_20260915-165000" },
+    };
+    try std.testing.expectEqualStrings("20260915-165000", pickNewest(&all_prefixed).?);
+
+    try std.testing.expect(pickNewest(&[_]ManifestFrame{}) == null);
+}
+
+test "uniqueTimes: one entry per stamp, sorted, not one per region" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Same instant repeated once per region, and deliberately out of order.
+    const frames = [_]ManifestFrame{
+        .{ .id = "hawaii_20260915-165000", .time = "2026-09-15T16:50:00Z" },
+        .{ .id = "20260915-164000", .time = "2026-09-15T16:40:00Z" },
+        .{ .id = "alaska_20260915-165000", .time = "2026-09-15T16:50:00Z" },
+        .{ .id = "alaska_20260915-164000", .time = "2026-09-15T16:40:00Z" },
+        .{ .id = "carib_20260915-165000", .time = "2026-09-15T16:50:00Z" },
+    };
+    const t = try uniqueTimes(arena, &frames);
+    try std.testing.expectEqual(@as(usize, 2), t.len);
+    try std.testing.expectEqualStrings("2026-09-15T16:40:00Z", t[0]);
+    try std.testing.expectEqualStrings("2026-09-15T16:50:00Z", t[1]);
+
+    try std.testing.expectEqual(@as(usize, 0), (try uniqueTimes(arena, &[_]ManifestFrame{})).len);
 }
