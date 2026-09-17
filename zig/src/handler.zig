@@ -13,6 +13,7 @@ const stamp = @import("stamp.zig");
 const manifest = @import("manifest.zig");
 const obs = @import("obs.zig");
 const tiles = @import("tiles.zig");
+const ptype = @import("ptype.zig");
 
 /// Pixel density of the prod CONUS precip output (6373x4161 over the CONUS
 /// mercator extent). Every region is warped to this so all RADs share one
@@ -130,6 +131,21 @@ const Encoded = struct { rad: []u8, path: []const u8 };
 /// encode+write under a DIFFERENT stamp than the source grib carries.
 /// Caller frees both fields.
 fn encodeAndWrite(alloc: std.mem.Allocator, warped: gdal.Warped, s: stamp.Stamp, out_dir: []const u8, id_prefix: []const u8) !Encoded {
+    // Fold obs precip_type into the reflectivity bands BEFORE encoding, so the
+    // typing is in the frame every client reads. Best-effort by design: a
+    // missing, stale or unreadable obs frame ships plain dBZ rather than
+    // failing the ingest — radar is the product, typing is an enrichment.
+    // The flow sidecar below is unaffected: radcore's flow.zig normalizes the
+    // bands away before block-matching.
+    if (ptype.load(alloc, s)) |found| {
+        if (found) |field| {
+            const n = ptype.apply(warped.band, warped.geo_tran, @intCast(warped.max_x), @intCast(warped.max_y), field);
+            std.log.info("{s}{s}: typed {d} px from obs precip_type", .{ id_prefix, s.slice(), n });
+        }
+    } else |err| {
+        std.log.warn("precip typing skipped for {s}{s}: {s}", .{ id_prefix, s.slice(), @errorName(err) });
+    }
+
     // RAD3 (paged best-of stream) for radar too — CONUS 0.79 → 0.55 MB,
     // Alaska 0.31 → 0.13 MB, and page-addressable decode in the clients.
     // RAD_RAD3=0 keeps RAD2 (every client decodes both).

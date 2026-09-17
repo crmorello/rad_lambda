@@ -311,4 +311,53 @@ R10D=$(invoke "$(event "$FILL_TWO")")
 echo ":02 -> $R10D"
 echo "$R10D" | grep -q '"processed":\[\],"skipped":1' || fail ":02 should never produce a fill"
 
-echo "E2E PASS: radar + skip + gzip metadata + manifest + byte parity + obs + warm reuse + prefix filter + tiles + tiles-only + 5-min fills"
+# --- 11: precip typing from obs precip_type --------------------------------
+# The radar container reads obs/precip_type out of the SAME bucket it writes to
+# (sourceDir derives it from RAD_OUTPUT's parent). Case 5 already produced a
+# precip_type frame, but months away from the radar grib -- restamp a copy so it
+# lands inside the 30-minute window, then reprocess the same grib.
+PT_STAMP=$(date -u -r $(( $(date -u -j -f "%Y%m%d-%H%M%S" "$ON_STAMP" +%s) - 300 )) +%Y%m%d-%H%M%S)
+docker exec "$MINIO" mc cp "local/rad-output/obs/precip_type/$OBS_STAMP.rad" \
+  "local/rad-output/obs/precip_type/$PT_STAMP.rad" >/dev/null
+PT_BYTES=$(docker exec "$MINIO" mc stat --json "local/rad-output/obs/precip_type/$PT_STAMP.rad" \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["size"])')
+printf '{"product":"precip_type","frames":[{"id":"%s","url":"/obs/precip_type/%s.rad","bytes":%s}]}' \
+  "$PT_STAMP" "$PT_STAMP" "$PT_BYTES" > "$WORK/pt_manifest.json"
+docker cp "$WORK/pt_manifest.json" "$MINIO":/tmp/ptm.json >/dev/null
+docker exec "$MINIO" mc cp /tmp/ptm.json local/rad-output/obs/precip_type/manifest.json >/dev/null
+
+docker exec "$MINIO" mc cat "local/rad-output/rads/$ON_STAMP.rad" > "$WORK/untyped.gz"
+# Read the log delta by line offset, NOT by diff: diff exits 1 when the files
+# differ, which under `set -o pipefail` kills the script on the very case we
+# are testing for.
+LOG_N=$(docker logs "$LAMBDA" 2>&1 | wc -l | tr -d " ")
+R11=$(invoke "$(event "$ON_NAME")")
+echo "typed -> $R11"
+docker logs "$LAMBDA" 2>&1 | tail -n +$((LOG_N + 1)) > "$WORK/log_delta.txt"
+grep -oE "typed [0-9]+ px from obs precip_type" "$WORK/log_delta.txt" | tail -1 || true
+
+TYPED_N=$(grep -oE "typed [0-9]+ px" "$WORK/log_delta.txt" | grep -oE "[0-9]+" | tail -1 || true)
+[ -n "$TYPED_N" ] && [ "$TYPED_N" -gt 0 ] || fail "precip typing applied to 0 pixels (expected > 0)"
+
+# The frame must actually have changed on disk.
+docker exec "$MINIO" mc cat "local/rad-output/rads/$ON_STAMP.rad" > "$WORK/typed.gz"
+cmp -s "$WORK/untyped.gz" "$WORK/typed.gz" && fail "typed frame is byte-identical to the untyped one"
+
+# Stale obs must fail SAFE: same grib, a manifest 31 minutes out, no typing.
+PT_OLD=$(date -u -r $(( $(date -u -j -f "%Y%m%d-%H%M%S" "$ON_STAMP" +%s) - 1860 )) +%Y%m%d-%H%M%S)
+docker exec "$MINIO" mc cp "local/rad-output/obs/precip_type/$PT_STAMP.rad" \
+  "local/rad-output/obs/precip_type/$PT_OLD.rad" >/dev/null
+docker exec "$MINIO" mc rm "local/rad-output/obs/precip_type/$PT_STAMP.rad" >/dev/null
+printf '{"product":"precip_type","frames":[{"id":"%s","url":"/obs/precip_type/%s.rad","bytes":%s}]}' \
+  "$PT_OLD" "$PT_OLD" "$PT_BYTES" > "$WORK/pt_old.json"
+docker cp "$WORK/pt_old.json" "$MINIO":/tmp/pto.json >/dev/null
+docker exec "$MINIO" mc cp /tmp/pto.json local/rad-output/obs/precip_type/manifest.json >/dev/null
+
+LOG_N2=$(docker logs "$LAMBDA" 2>&1 | wc -l | tr -d " ")
+invoke "$(event "$ON_NAME")" >/dev/null
+docker logs "$LAMBDA" 2>&1 | tail -n +$((LOG_N2 + 1)) > "$WORK/log_delta2.txt"
+grep -q "no precip_type frame within 30 min" "$WORK/log_delta2.txt" \
+  || fail "a 31-minute-old precip_type frame was not rejected"
+echo "stale obs -> rejected, frame ships untyped"
+
+echo "E2E PASS: radar + skip + gzip metadata + manifest + byte parity + obs + warm reuse + prefix filter + tiles + tiles-only + 5-min fills + precip typing"

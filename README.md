@@ -144,6 +144,39 @@ CloudFront KeyValueStore checked by a viewer-request function, stripped
 before caching). Both are plain aws-cli and re-runnable; neither has been
 run against the live account yet.
 
+## Precip typing (rain / mixed / snow)
+
+Radar frames carry precipitation type as well as dBZ, folded into the byte per
+radcore's banding model (`recon.zig` `bandOf`/`bandByte`):
+
+    rain   1..88     byte = dBZ
+    mixed  90..168   byte = clamp(dBZ + 80,  90, 168)
+    snow   170..254  byte = clamp(dBZ + 160, 170, 254)
+    89, 169 and 255 are separators and are never emitted
+
+The type comes from the **obs `precip_type` product** we already publish, not a
+separate feed: `zig/src/ptype.zig` reads the newest `obs/precip_type` frame at
+or before the radar stamp (30-minute staleness limit), samples it
+nearest-neighbour through the two geotransforms, and offsets the byte. Codes map
+1 rain / 2 storm → rain, 3 → snow, 4 sleet / 5 mixed → mixed.
+
+Only echo at **≥ 10 dBZ** is typed: the mixed and snow bands cannot express
+below that, so typing a 3 dBZ pixel would clamp it up and invent echo. Anything
+weaker, outside the obs domain (which is CONUS-only — Alaska, Hawaii, Carib and
+Guam are never typed), or with no obs frame inside the window stays plain dBZ.
+Typing is best-effort: a missing or unreadable obs frame ships an untyped frame
+rather than failing the ingest.
+
+`RAD_TYPE_SOURCE` overrides where the codes come from; pointing it at a path
+that does not exist disables typing without a deploy. CLI mode has no
+`RAD_OUTPUT` to derive the source from, so it never types — which is why
+`scripts/verify_parity.sh` output is unaffected.
+
+Two things downstream to know before relying on this: radcore's Z-R
+accumulation (`core.zig:1296`, `:1449`) squares the **raw** byte without calling
+`bandNormalize`, so typed snow accumulates ~40x overweight; and default-ramp
+bytes 200..209 render opaque black, i.e. snow at 40..49 dBZ.
+
 ## RAD3 output
 
 Both producers write RAD3 (radcore `docs/rad-format.md`): radar warps since
