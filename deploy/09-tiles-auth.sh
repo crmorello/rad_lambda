@@ -3,6 +3,7 @@
 # a CloudFront KeyValueStore holds the keys, a viewer-request CloudFront
 # Function looks up `api_key` (query) or `Authorization: Bearer …`, rejects
 # with 401, and strips the key so the cache key stays path + render params.
+# The function's source is deploy/tile-auth.js (edit it there, then re-run).
 #
 #   deploy/09-tiles-auth.sh <distribution-id> <keys-file>
 # keys-file: one "<key> <customer-label>" per line (never commit it).
@@ -32,31 +33,19 @@ aws cloudfront-keyvaluestore update-keys --kvs-arn "$KVS_ARN" --if-match "$KVS_E
 echo "keys loaded: $(wc -l < "$KEYS_FILE")"
 
 echo "== viewer-request function"
-cat > /tmp/tile-auth.js <<'JS'
-import cf from 'cloudfront';
-const kvs = cf.kvs();
-async function handler(event) {
-  const req = event.request;
-  let key = null;
-  if (req.querystring.api_key) key = req.querystring.api_key.value;
-  else if (req.headers.authorization) key = req.headers.authorization.value.replace(/^Bearer\s+/i, '');
-  if (!key) return { statusCode: 401, statusDescription: 'Unauthorized', body: 'api_key required' };
-  try { await kvs.get(key); } catch (e) {
-    return { statusCode: 401, statusDescription: 'Unauthorized', body: 'invalid api_key' };
-  }
-  delete req.querystring.api_key;      // not part of the cache key or the origin request
-  delete req.headers.authorization;
-  return req;
-}
-JS
+# Source lives in tile-auth.js next to this script (we cd'd here above) so the
+# edge auth logic is reviewable and diffable on its own -- it is the thing
+# standing between the internet and the bucket.
+FN_SRC="tile-auth.js"
+[ -f "$FN_SRC" ] || { echo "missing $FN_SRC beside $0" >&2; exit 1; }
 CONFIG="{\"Comment\":\"tile api keys\",\"Runtime\":\"cloudfront-js-2.0\",\"KeyValueStoreAssociations\":{\"Quantity\":1,\"Items\":[{\"KeyValueStoreARN\":\"${KVS_ARN}\"}]}}"
 if aws cloudfront describe-function --name "$FN_NAME" >/dev/null 2>&1; then
   FETAG=$(aws cloudfront describe-function --name "$FN_NAME" --query ETag --output text)
   FETAG=$(aws cloudfront update-function --name "$FN_NAME" --if-match "$FETAG" --function-config "$CONFIG" \
-    --function-code fileb:///tmp/tile-auth.js --query ETag --output text)
+    --function-code fileb://"$FN_SRC" --query ETag --output text)
 else
   FETAG=$(aws cloudfront create-function --name "$FN_NAME" --function-config "$CONFIG" \
-    --function-code fileb:///tmp/tile-auth.js --query ETag --output text)
+    --function-code fileb://"$FN_SRC" --query ETag --output text)
 fi
 aws cloudfront publish-function --name "$FN_NAME" --if-match "$FETAG" >/dev/null
 FN_ARN=$(aws cloudfront describe-function --name "$FN_NAME" --stage LIVE --query 'FunctionSummary.FunctionMetadata.FunctionARN' --output text)
