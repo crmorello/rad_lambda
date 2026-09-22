@@ -126,25 +126,55 @@ pub fn urlPrefix(alloc: std.mem.Allocator) ![]const u8 {
 
 const Encoded = struct { rad: []u8, path: []const u8 };
 
+/// Where a frame's pixels came from: the grib, ITS stamp and the warp
+/// resolution. The stamp differs from the output stamp for the 5-minute
+/// fills (a :05 frame is written from :04 radar), and precip typing must use
+/// the SOURCE time — MRMS has no :05 flag, and obs "at or before :05" could
+/// be a minute newer than the radar it types.
+const Origin = struct { input: []const u8, stamp: stamp.Stamp, res: f64 };
+
+/// Fold precip type into the reflectivity bands in place, from whichever
+/// source covers this region (ptype.sourceFor). `s` is the OUTPUT stamp, used
+/// only to name the frame in logs.
+fn typeFrame(alloc: std.mem.Allocator, warped: gdal.Warped, s: stamp.Stamp, id_prefix: []const u8, origin: Origin) !void {
+    const w: usize = @intCast(warped.max_x);
+    const h: usize = @intCast(warped.max_y);
+    switch (ptype.sourceFor(id_prefix)) {
+        .none => {},
+        .obs => if (try ptype.load(alloc, origin.stamp)) |field| {
+            const n = ptype.apply(warped.band, warped.geo_tran, w, h, field, ptype.Band.fromCode);
+            std.log.info("{s}{s}: typed {d} px from obs precip_type", .{ id_prefix, s.slice(), n });
+        },
+        .mrms => if (try ptype.loadMrmsFlag(alloc, origin.input, origin.stamp, origin.res)) |field| {
+            defer alloc.free(field.codes);
+            // Same MRMS grid + same warp options = same output grid. codeAt
+            // samples by geotransform, so a mismatch still types correctly —
+            // but it would mean NOAA changed one grid, which is worth seeing.
+            if (field.w != w or field.h != h or !std.mem.eql(f64, &field.geo, &warped.geo_tran)) {
+                std.log.warn("{s}{s}: PrecipFlag grid {d}x{d} differs from radar {d}x{d}; sampling by geotransform", .{
+                    id_prefix, s.slice(), field.w, field.h, w, h,
+                });
+            }
+            const n = ptype.apply(warped.band, warped.geo_tran, w, h, &field, ptype.mrmsBand);
+            std.log.info("{s}{s}: typed {d} px from MRMS PrecipFlag", .{ id_prefix, s.slice(), n });
+        },
+    }
+}
+
 /// Encode a warped band AT `s` and write it to `{out_dir}/{id_prefix}{s}.rad`.
 /// Split out of processFile because the 5-minute tile slots need the same
 /// encode+write under a DIFFERENT stamp than the source grib carries.
 /// Caller frees both fields.
-fn encodeAndWrite(alloc: std.mem.Allocator, warped: gdal.Warped, s: stamp.Stamp, out_dir: []const u8, id_prefix: []const u8) !Encoded {
-    // Fold obs precip_type into the reflectivity bands BEFORE encoding, so the
+fn encodeAndWrite(alloc: std.mem.Allocator, warped: gdal.Warped, s: stamp.Stamp, out_dir: []const u8, id_prefix: []const u8, origin: Origin) !Encoded {
+    // Fold precip type into the reflectivity bands BEFORE encoding, so the
     // typing is in the frame every client reads. Best-effort by design: a
-    // missing, stale or unreadable obs frame ships plain dBZ rather than
+    // missing, stale or unreadable type source ships plain dBZ rather than
     // failing the ingest — radar is the product, typing is an enrichment.
     // The flow sidecar below is unaffected: radcore's flow.zig normalizes the
     // bands away before block-matching.
-    if (ptype.load(alloc, s)) |found| {
-        if (found) |field| {
-            const n = ptype.apply(warped.band, warped.geo_tran, @intCast(warped.max_x), @intCast(warped.max_y), field);
-            std.log.info("{s}{s}: typed {d} px from obs precip_type", .{ id_prefix, s.slice(), n });
-        }
-    } else |err| {
+    typeFrame(alloc, warped, s, id_prefix, origin) catch |err| {
         std.log.warn("precip typing skipped for {s}{s}: {s}", .{ id_prefix, s.slice(), @errorName(err) });
-    }
+    };
 
     // RAD3 (paged best-of stream) for radar too — CONUS 0.79 → 0.55 MB,
     // Alaska 0.31 → 0.13 MB, and page-addressable decode in the clients.
@@ -173,7 +203,7 @@ pub fn processFile(alloc: std.mem.Allocator, input: []const u8, out_dir: []const
     const warped = try gdal.warpBand(alloc, input, res);
     defer alloc.free(warped.band);
 
-    const w = try encodeAndWrite(alloc, warped, s, out_dir, id_prefix);
+    const w = try encodeAndWrite(alloc, warped, s, out_dir, id_prefix, .{ .input = input, .stamp = s, .res = res });
     defer alloc.free(w.rad);
 
     // Best-effort flow sidecar for the pair ending at this frame — never
@@ -203,9 +233,10 @@ fn processRelabelled(alloc: std.mem.Allocator, input: []const u8, out_dir: []con
             return null;
         }
     }
+    const source = stamp.fromFilename(std.fs.path.basename(input)) orelse return error.NoTimestampInFilename;
     const warped = try gdal.warpBand(alloc, input, res);
     defer alloc.free(warped.band);
-    const w = try encodeAndWrite(alloc, warped, target, out_dir, id_prefix);
+    const w = try encodeAndWrite(alloc, warped, target, out_dir, id_prefix, .{ .input = input, .stamp = source, .res = res });
     alloc.free(w.rad);
     return w.path;
 }

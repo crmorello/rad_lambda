@@ -26,6 +26,12 @@ snow   bytes 170..254  dBZ = byte - 160
 The bands are **not** symmetric: mixed and snow start at 10 dBZ, and snow runs
 to 94. Anything that assumes `byte == dBZ` is wrong for typed pixels.
 
+**Per region:** CONUS is typed from our obs and can carry all three bands.
+Alaska (`alaska_*` frames) is typed from MRMS PrecipFlag, which has no mixed
+class, so Alaska frames carry **rain and snow only, never mixed**. Hawaii,
+Caribbean and Guam are untyped. Nothing needs to change on the client; this only
+means an Alaska-only view will never show the mixed colour.
+
 ## Already correct — please don't redo it
 
 Most of this work is already done, and it is genuinely correct. Verified line by

@@ -40,6 +40,23 @@ pub const Warped = struct {
 /// resolution (mercator meters/pixel, "med" resampling) into a MEM dataset,
 /// and reads band 1 as bytes. Caller frees `band`.
 pub fn warpBand(alloc: std.mem.Allocator, path: []const u8, resolution: f64) !Warped {
+    return warpBandOpts(alloc, path, resolution, .{});
+}
+
+pub const WarpOpts = struct {
+    /// gdalwarp -r. "med" suits reflectivity; a CATEGORICAL field (MRMS
+    /// PrecipFlag codes) must use "near" — median ranks codes as magnitudes.
+    resample: [:0]const u8 = "med",
+    /// GDALOpen attempts, with the backoff below between them. 1 = probe:
+    /// absence is an expected answer, not a transient to wait out, and the
+    /// miss is silent (see the loop).
+    attempts: usize = 6,
+};
+
+/// warpBand with the resampling and open-retry policy exposed. The output
+/// grid depends only on the source extent, -t_srs and -tr — never on `opts`
+/// — so two same-grid sources warp to the same geotransform.
+pub fn warpBandOpts(alloc: std.mem.Allocator, path: []const u8, resolution: f64, opts: WarpOpts) !Warped {
     const gdal_path = if (std.mem.endsWith(u8, path, ".gz") and !std.mem.startsWith(u8, path, "/vsigzip/"))
         try std.fmt.allocPrintSentinel(alloc, "/vsigzip/{s}", .{path}, 0)
     else
@@ -56,14 +73,19 @@ pub fn warpBand(alloc: std.mem.Allocator, path: []const u8, resolution: f64) !Wa
     // marks were lost to poisoned warm containers).
     var opened: c.GDALDatasetH = null;
     var attempt: usize = 0;
-    while (attempt < 6) : (attempt += 1) {
+    while (attempt < opts.attempts) : (attempt += 1) {
         if (attempt > 0) {
             c.VSICurlClearCache();
             _ = c.usleep(@as(c_uint, 1_000_000) << @intCast(attempt - 1));
         }
+        // A single-attempt probe expects misses; keep GDAL's own "No such
+        // file" error off stderr so CloudWatch doesn't read it as a failure.
+        const probe = opts.attempts == 1;
+        if (probe) c.CPLPushErrorHandler(c.CPLQuietErrorHandler);
         opened = c.GDALOpen(gdal_path.ptr, c.GA_ReadOnly);
+        if (probe) c.CPLPopErrorHandler();
         if (opened != null) break;
-        std.debug.print("GDALOpen attempt {d} failed for {s}: {s}\n", .{
+        if (!probe) std.debug.print("GDALOpen attempt {d} failed for {s}: {s}\n", .{
             attempt + 1, gdal_path, std.mem.span(c.CPLGetLastErrorMsg()),
         });
     }
@@ -73,7 +95,7 @@ pub fn warpBand(alloc: std.mem.Allocator, path: []const u8, resolution: f64) !Wa
     var res_buf: [64]u8 = undefined;
     const res: [:0]const u8 = std.fmt.bufPrintSentinel(&res_buf, "{d}", .{resolution}, 0) catch unreachable;
     const argv = [_:null]?[*:0]const u8{
-        "-of", "MEM", "-t_srs", "EPSG:3857", "-r", "med", "-tr", res.ptr, res.ptr,
+        "-of", "MEM", "-t_srs", "EPSG:3857", "-r", opts.resample.ptr, "-tr", res.ptr, res.ptr,
     };
     const options = c.GDALWarpAppOptionsNew(@ptrCast(@constCast(&argv)), null) orelse
         return GdalError.WarpOptionsRejected;
@@ -162,6 +184,13 @@ pub fn vsiRead(alloc: std.mem.Allocator, path: []const u8) !?[]u8 {
         return null;
     }
     return buf;
+}
+
+/// Drops ALL of GDAL's in-process vsicurl cache. Use before probing keys that
+/// may have been looked up while still absent: the partial clear below does
+/// NOT reliably drop a negative entry (see warpBandOpts).
+pub fn clearAllVsiCache() void {
+    c.VSICurlClearCache();
 }
 
 /// Drops GDAL's in-process vsicurl cache entries under `prefix`. The cache

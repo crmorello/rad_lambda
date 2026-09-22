@@ -360,4 +360,56 @@ grep -q "no precip_type frame within 30 min" "$WORK/log_delta2.txt" \
   || fail "a 31-minute-old precip_type frame was not rejected"
 echo "stale obs -> rejected, frame ships untyped"
 
-echo "E2E PASS: radar + skip + gzip metadata + manifest + byte parity + obs + warm reuse + prefix filter + tiles + tiles-only + 5-min fills + precip typing"
+# --- 12: Alaska precip typing from MRMS PrecipFlag -------------------------
+# obs covers CONUS only; alaska_ frames read the sibling PrecipFlag grib beside
+# the radar grib (T, then T-2, then T-4 min). A real January frame, because a
+# summer one has no snow to find. The expected counts are what an independent
+# gdalwarp (-r med radar, -r near flag, 1222.8 m) gives for "flag == 3 and
+# echo >= 10 dBZ" -- the lambda's own count must match exactly.
+AK_DAY=20260115
+AK_CACHE="$RIE_CACHE/alaska-$AK_DAY"
+mkdir -p "$AK_CACHE"
+for key in SeamlessHSR_00.00/MRMS_SeamlessHSR_00.00_$AK_DAY-120000 \
+           PrecipFlag_00.00/MRMS_PrecipFlag_00.00_$AK_DAY-120000 \
+           PrecipFlag_00.00/MRMS_PrecipFlag_00.00_$AK_DAY-115800; do
+  f="$AK_CACHE/$(basename "$key").grib2.gz"
+  [ -s "$f" ] || aws s3 cp --no-sign-request --only-show-errors \
+    "s3://noaa-mrms-pds/ALASKA/${key%%/*}/$AK_DAY/$(basename "$key").grib2.gz" "$f" \
+    || fail "could not fetch Alaska fixture $key"
+done
+for f in "$AK_CACHE"/*.grib2.gz; do
+  product=$(basename "$f" | sed -E 's/^MRMS_(.*)_[0-9]{8}-[0-9]{6}\.grib2\.gz$/\1/')
+  docker cp "$f" "$MINIO":/tmp/ak.gz
+  docker exec "$MINIO" mc cp /tmp/ak.gz "local/noaa-mrms-pds/ALASKA/$product/$AK_DAY/$(basename "$f")" >/dev/null
+done
+AK_EVENT=$(printf '{"Records":[{"s3":{"bucket":{"name":"noaa-mrms-pds"},"object":{"key":"ALASKA/SeamlessHSR_00.00/%s/MRMS_SeamlessHSR_00.00_%s-120000.grib2.gz"}}}]}' "$AK_DAY" "$AK_DAY")
+
+ak_run() { # $1 = label; leaves the log delta in $WORK/ak.txt
+  local n; n=$(docker logs "$LAMBDA" 2>&1 | wc -l | tr -d " ")
+  local r; r=$(invoke "$AK_EVENT")
+  echo "$1 -> $r"
+  echo "$r" | grep -q "alaska_$AK_DAY-120000.rad" || fail "$1: alaska frame not written"
+  docker logs "$LAMBDA" 2>&1 | tail -n +$((n + 1)) > "$WORK/ak.txt"
+  # A missed probe is the NORMAL case for T; it must not look like a failure.
+  grep -qE "GDALOpen attempt|ERROR [0-9]+:" "$WORK/ak.txt" && fail "$1: flag probe leaked an open error to the log"
+  return 0
+}
+ak_typed() { grep -oE "typed [0-9]+ px from MRMS PrecipFlag" "$WORK/ak.txt" | grep -oE "[0-9]+" | tail -1 || true; }
+
+ak_run "alaska, flag T present"
+grep -q "MRMS PrecipFlag $AK_DAY-120000 typing $AK_DAY-120000 (lag 0s)" "$WORK/ak.txt" || fail "same-stamp flag not used"
+[ "$(ak_typed)" = "483760" ] || fail "alaska typed $(ak_typed) px, expected 483760"
+grep -q "from obs precip_type" "$WORK/ak.txt" && fail "alaska frame was typed from CONUS obs"
+grep -q "PrecipFlag grid .* differs" "$WORK/ak.txt" && fail "PrecipFlag and radar grids diverged"
+
+docker exec "$MINIO" mc rm "local/noaa-mrms-pds/ALASKA/PrecipFlag_00.00/$AK_DAY/MRMS_PrecipFlag_00.00_$AK_DAY-120000.grib2.gz" >/dev/null
+ak_run "alaska, flag T missing"
+grep -q "MRMS PrecipFlag $AK_DAY-115800 typing $AK_DAY-120000 (lag 120s)" "$WORK/ak.txt" || fail "T-2 fallback not used"
+[ "$(ak_typed)" = "482805" ] || fail "alaska T-2 typed $(ak_typed) px, expected 482805"
+
+docker exec "$MINIO" mc rm "local/noaa-mrms-pds/ALASKA/PrecipFlag_00.00/$AK_DAY/MRMS_PrecipFlag_00.00_$AK_DAY-115800.grib2.gz" >/dev/null
+ak_run "alaska, no flags"
+grep -q "no MRMS PrecipFlag within 4 min of $AK_DAY-120000; untyped" "$WORK/ak.txt" || fail "missing flags did not fail safe"
+[ -z "$(ak_typed)" ] || fail "typed without any flag"
+
+echo "E2E PASS: radar + skip + gzip metadata + manifest + byte parity + obs + warm reuse + prefix filter + tiles + tiles-only + 5-min fills + precip typing + alaska MRMS typing"

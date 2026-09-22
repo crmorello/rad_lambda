@@ -1,5 +1,11 @@
-//! Precip typing: fold the obs `precip_type` codes into the radar reflectivity
-//! banding model, so a frame carries rain / mixed / snow as well as dBZ.
+//! Precip typing: fold precip-type codes into the radar reflectivity banding
+//! model, so a frame carries rain / mixed / snow as well as dBZ.
+//!
+//! Two sources, chosen by region (`sourceFor`):
+//!   CONUS  - the obs `precip_type` series (rain / mixed / snow)
+//!   Alaska - MRMS PrecipFlag, read beside the radar grib (rain / snow only:
+//!            MRMS has no mixed or sleet class)
+//! Other MRMS regions (Hawaii, Caribbean, Guam) ship untyped.
 //!
 //! radcore already consumes typed bytes everywhere — it unfolds them
 //! (products.zig value/describe), renders three colour runs, keeps types from
@@ -54,6 +60,21 @@ pub const Band = enum(u8) {
     }
 };
 
+/// Maps a source's raw code to a band. obs and MRMS number their classes
+/// differently, so `apply` takes the mapper rather than assuming one table.
+pub const Mapper = *const fn (u8) Band;
+
+/// MRMS PrecipFlag codes (all regions share the table):
+///   -3 no coverage   0 no precip   1 warm stratiform rain   3 SNOW
+///    6 convective    7 rain+hail  10 cold stratiform rain
+///   91 tropical/stratiform mix    96 tropical/convective mix
+/// Only snow is a winter class; there is no mixed or sleet code, so MRMS
+/// never yields the mixed band. -3 reads as 0 once warped to GDT_Byte (GDAL
+/// clamps negatives), and both are "untyped" anyway.
+pub fn mrmsBand(code: u8) Band {
+    return if (code == 3) .snow else .rain;
+}
+
 /// dBZ byte -> banded byte. Mirrors radcore recon.zig bandByte.
 pub fn fold(dbz: u8, band: Band) u8 {
     if (band == .rain) return dbz;
@@ -93,7 +114,7 @@ pub const Field = struct {
 /// Type a warped radar band in place. Returns how many pixels were typed as
 /// something other than rain — worth logging, since "0" means the obs frame
 /// resolved but contributed nothing, which looks the same as no obs at all.
-pub fn apply(band: []u8, geo: [6]f64, w: usize, h: usize, field: *const Field) usize {
+pub fn apply(band: []u8, geo: [6]f64, w: usize, h: usize, field: *const Field, map: Mapper) usize {
     var typed: usize = 0;
     var row: usize = 0;
     while (row < h) : (row += 1) {
@@ -104,7 +125,7 @@ pub fn apply(band: []u8, geo: [6]f64, w: usize, h: usize, field: *const Field) u
             const dbz = band[i];
             if (dbz < MIN_TYPED_DBZ) continue; // also skips 0 = no data
             const mx = geo[0] + (@as(f64, @floatFromInt(col)) + 0.5) * geo[1];
-            const b = Band.fromCode(field.codeAt(mx, my));
+            const b = map(field.codeAt(mx, my));
             if (b == .rain) continue;
             band[i] = fold(dbz, b);
             typed += 1;
@@ -166,6 +187,81 @@ pub fn pickFrame(alloc: std.mem.Allocator, manifest_json: []const u8, target: st
         }
     }
     return best;
+}
+
+// ------------------------------------------------------------- MRMS PrecipFlag
+
+pub const Source = enum { obs, mrms, none };
+
+/// Which typing source a region's frames use, by the handler's id prefix.
+/// RAD_TYPE_MRMS=0 turns the MRMS source off without a deploy.
+pub fn sourceFor(id_prefix: []const u8) Source {
+    if (id_prefix.len == 0) return .obs; // CONUS is the unprefixed region
+    if (std.mem.eql(u8, id_prefix, "alaska_")) {
+        if (handler.getenv("RAD_TYPE_MRMS")) |v| {
+            if (std.mem.eql(u8, v, "0")) return .none;
+        }
+        return .mrms;
+    }
+    return .none;
+}
+
+const FLAG_PRODUCT = "PrecipFlag_00.00";
+
+/// The PrecipFlag object for stamp `s`, beside the radar grib `radar_input`
+/// (".../ALASKA/SeamlessHSR_00.00/20260922/MRMS_SeamlessHSR_00.00_...grib2.gz").
+/// The day directory is rebuilt from `s`, NOT copied from the radar path: the
+/// T-2 fallback for a 00:00 frame is 23:58 in the previous day's directory.
+/// null when the path does not have the MRMS region/product/day layout (a
+/// loose local grib), which just means "no flag to look for".
+pub fn flagKey(alloc: std.mem.Allocator, radar_input: []const u8, s: stamp.Stamp) !?[]const u8 {
+    const day_dir = std.fs.path.dirname(radar_input) orelse return null;
+    const day = std.fs.path.basename(day_dir);
+    if (day.len != 8) return null;
+    for (day) |ch| if (!std.ascii.isDigit(ch)) return null;
+    const product_dir = std.fs.path.dirname(day_dir) orelse return null;
+    const region_dir = std.fs.path.dirname(product_dir) orelse return null;
+    const st = s.slice();
+    return try std.fmt.allocPrint(alloc, "{s}/{s}/{s}/MRMS_{s}_{s}.grib2.gz", .{
+        region_dir, FLAG_PRODUCT, st[0..8], FLAG_PRODUCT, st,
+    });
+}
+
+/// How far back to look. The flag for stamp T usually lands ~30 s AFTER the
+/// radar frame for T, so T is often absent when the radar is processed and
+/// T-2 is the normal hit. 4 min of lag is well inside MAX_AGE_MS.
+const FLAG_LOOKBACK_MIN = [_]i64{ 0, 2, 4 };
+
+/// Warp the newest PrecipFlag at or up to 4 min before `source` onto the radar
+/// grid and return it as a Field the caller owns (free `codes`). null when
+/// none of the probed stamps exist. Deliberately not the obs warm cache: each
+/// radar frame wants its own flag, and that cache holds one path.
+pub fn loadMrmsFlag(alloc: std.mem.Allocator, radar_input: []const u8, source: stamp.Stamp, res: f64) !?Field {
+    // One full clear up front: a flag probed while still absent (T, just
+    // before it landed) leaves a negative vsicurl entry that the partial
+    // per-prefix clear does not drop, and a later frame may probe that key.
+    if (std.mem.startsWith(u8, radar_input, "/vsi")) gdal.clearAllVsiCache();
+
+    for (FLAG_LOOKBACK_MIN) |back| {
+        const s = stamp.fromMs(source.ms() - back * std.time.ms_per_min) orelse continue;
+        const key = (try flagKey(alloc, radar_input, s)) orelse return null;
+        defer alloc.free(key);
+        // "near": the codes are categorical. One attempt: absence is the
+        // expected answer for T, not a transient to back off on.
+        const warped = gdal.warpBandOpts(alloc, key, res, .{ .resample = "near", .attempts = 1 }) catch |err| switch (err) {
+            error.OpenFailed => continue,
+            else => return err,
+        };
+        log.info("MRMS PrecipFlag {s} typing {s} (lag {d}s)", .{ s.slice(), source.slice(), back * 60 });
+        return .{
+            .codes = warped.band,
+            .w = @intCast(warped.max_x),
+            .h = @intCast(warped.max_y),
+            .geo = warped.geo_tran,
+        };
+    }
+    log.info("no MRMS PrecipFlag within {d} min of {s}; untyped", .{ FLAG_LOOKBACK_MIN[FLAG_LOOKBACK_MIN.len - 1], source.slice() });
+    return null;
 }
 
 // ------------------------------------------------------------- warm-frame cache
@@ -365,13 +461,13 @@ test "apply: types only echo >= 10 dBZ, leaves the rest alone" {
     const f = Field{ .codes = &codes, .w = 4, .h = 1, .geo = .{ 0, 1000, 0, 0, 0, -1000 } };
     // Same geometry for the "radar" band so cells line up 1:1.
     var band = [_]u8{ 30, 30, 30, 30 };
-    var n = apply(&band, .{ 0, 1000, 0, 0, 0, -1000 }, 4, 1, &f);
+    var n = apply(&band, .{ 0, 1000, 0, 0, 0, -1000 }, 4, 1, &f, Band.fromCode);
     try testing.expectEqual(@as(usize, 2), n); // only snow + mixed count
     try testing.expectEqualSlices(u8, &.{ 190, 110, 30, 30 }, &band);
 
     // Weak echo and nodata are untouched even under a snow code.
     var weak = [_]u8{ 9, 5, 0, 1 };
-    n = apply(&weak, .{ 0, 1000, 0, 0, 0, -1000 }, 4, 1, &f);
+    n = apply(&weak, .{ 0, 1000, 0, 0, 0, -1000 }, 4, 1, &f, Band.fromCode);
     try testing.expectEqual(@as(usize, 0), n);
     try testing.expectEqualSlices(u8, &.{ 9, 5, 0, 1 }, &weak);
 }
@@ -414,4 +510,72 @@ test "typed bytes survive a RAD3 round trip and decode to the right dBZ" {
         const dbz = radcore.products.value(rv, b).?;
         try testing.expect(dbz >= 10 and dbz <= 88);
     }
+}
+
+test "MRMS code -> band: only snow is a winter class" {
+    try testing.expectEqual(Band.snow, mrmsBand(3));
+    // Every rain variant stays rain — including 7 (rain + hail), which is
+    // convective, not mixed-phase.
+    for ([_]u8{ 1, 6, 7, 10, 91, 96 }) |code| try testing.expectEqual(Band.rain, mrmsBand(code));
+    // No coverage (-3 clamps to 0 in GDT_Byte) and no precip are untyped.
+    try testing.expectEqual(Band.rain, mrmsBand(0));
+    // MRMS has no mixed class; nothing may map there, including obs's 4/5.
+    for ([_]u8{ 2, 4, 5, 8, 9, 200, 255 }) |code| try testing.expect(mrmsBand(code) != .mixed);
+}
+
+test "sourceFor: CONUS -> obs, Alaska -> MRMS, other regions untyped" {
+    try testing.expectEqual(Source.obs, sourceFor(""));
+    try testing.expectEqual(Source.mrms, sourceFor("alaska_"));
+    try testing.expectEqual(Source.none, sourceFor("hawaii_"));
+    try testing.expectEqual(Source.none, sourceFor("carib_"));
+    try testing.expectEqual(Source.none, sourceFor("guam_"));
+}
+
+test "flagKey: sibling PrecipFlag path, day directory rebuilt from the stamp" {
+    const alloc = testing.allocator;
+    const radar = "/vsis3/noaa-mrms-pds/ALASKA/SeamlessHSR_00.00/20260922/MRMS_SeamlessHSR_00.00_20260922-195000.grib2.gz";
+    const mk = struct {
+        fn s(t: *const [15]u8) stamp.Stamp {
+            var out: stamp.Stamp = undefined;
+            @memcpy(&out.text, t);
+            return out;
+        }
+    }.s;
+
+    const same = (try flagKey(alloc, radar, mk("20260922-195000"))).?;
+    defer alloc.free(same);
+    try testing.expectEqualStrings(
+        "/vsis3/noaa-mrms-pds/ALASKA/PrecipFlag_00.00/20260922/MRMS_PrecipFlag_00.00_20260922-195000.grib2.gz",
+        same,
+    );
+
+    // T-2 across midnight lands in the PREVIOUS day's directory; copying the
+    // radar key's day would build a path that can never exist.
+    const midnight = "/vsis3/noaa-mrms-pds/ALASKA/SeamlessHSR_00.00/20260923/MRMS_SeamlessHSR_00.00_20260923-000000.grib2.gz";
+    const back = stamp.fromMs(mk("20260923-000000").ms() - 2 * std.time.ms_per_min).?;
+    const prev = (try flagKey(alloc, midnight, back)).?;
+    defer alloc.free(prev);
+    try testing.expectEqualStrings(
+        "/vsis3/noaa-mrms-pds/ALASKA/PrecipFlag_00.00/20260922/MRMS_PrecipFlag_00.00_20260922-235800.grib2.gz",
+        prev,
+    );
+
+    // Local mirror of the bucket layout works the same way (CLI QA runs).
+    const local = (try flagKey(alloc, "/tmp/mrms/ALASKA/SeamlessHSR_00.00/20260115/x.grib2.gz", mk("20260115-120000"))).?;
+    defer alloc.free(local);
+    try testing.expectEqualStrings("/tmp/mrms/ALASKA/PrecipFlag_00.00/20260115/MRMS_PrecipFlag_00.00_20260115-120000.grib2.gz", local);
+
+    // A loose grib with no region/product/day layout has no sibling to find.
+    try testing.expect((try flagKey(alloc, "/tmp/MRMS_SeamlessHSR_00.00_20260922-195000.grib2.gz", mk("20260922-195000"))) == null);
+    try testing.expect((try flagKey(alloc, "x.grib2.gz", mk("20260922-195000"))) == null);
+}
+
+test "apply with the MRMS mapper: snow types, nothing becomes mixed" {
+    // 3 snow, 10 cold stratiform rain, 1 warm rain, 0 no precip
+    var codes = [_]u8{ 3, 10, 1, 0 };
+    const f = Field{ .codes = &codes, .w = 4, .h = 1, .geo = .{ 0, 1000, 0, 0, 0, -1000 } };
+    var band = [_]u8{ 30, 30, 30, 30 };
+    const n = apply(&band, .{ 0, 1000, 0, 0, 0, -1000 }, 4, 1, &f, mrmsBand);
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqualSlices(u8, &.{ 190, 30, 30, 30 }, &band);
 }

@@ -154,28 +154,43 @@ radcore's banding model (`recon.zig` `bandOf`/`bandByte`):
     snow   170..254  byte = clamp(dBZ + 160, 170, 254)
     89, 169 and 255 are separators and are never emitted
 
-The type comes from the **obs `precip_type` product** we already publish, not a
-separate feed: `zig/src/ptype.zig` reads the newest `obs/precip_type` frame at
-or before the radar stamp (30-minute staleness limit), samples it
-nearest-neighbour through the two geotransforms, and offsets the byte. Codes map
-1 rain / 2 storm → rain, 3 → snow, 4 sleet / 5 mixed → mixed.
+The source depends on the region (`ptype.sourceFor`):
+
+- **CONUS: the obs `precip_type` product** we already publish.
+  `zig/src/ptype.zig` reads the newest `obs/precip_type` frame at or before the
+  radar stamp (30-minute staleness limit), samples it nearest-neighbour through
+  the two geotransforms, and offsets the byte. Codes map 1 rain / 2 storm →
+  rain, 3 → snow, 4 sleet / 5 mixed → mixed.
+- **Alaska: MRMS `PrecipFlag_00.00`**, since obs is CONUS-only. It is read from
+  beside the radar grib in `noaa-mrms-pds` (same bucket, same 2-minute stamps,
+  identical 0.01° grid), warped with `-r near` because the codes are
+  categorical, and tried at T, T-2 and T-4 minutes. The flag for T usually lands
+  about 30 s after the radar frame, so T-2 is the normal hit. MRMS has **no
+  mixed or sleet class**: code 3 → snow and every other code → rain, so Alaska
+  frames never carry the mixed band. There's no trigger, storage, or IAM for
+  this; it's one extra ~34 KB read per Alaska frame (about 0.5 s).
+  `RAD_TYPE_MRMS=0` turns it off.
+- **Hawaii, Caribbean and Guam** are never typed.
+
+Typing uses the frame's **source** stamp. A 5-minute fill written as `:05` from
+`:04` radar is typed as of `:04`.
 
 Only echo at **≥ 10 dBZ** is typed: the mixed and snow bands cannot express
 below that, so typing a 3 dBZ pixel would clamp it up and invent echo. Anything
-weaker, outside the obs domain (which is CONUS-only — Alaska, Hawaii, Carib and
-Guam are never typed), or with no obs frame inside the window stays plain dBZ.
-Typing is best-effort: a missing or unreadable obs frame ships an untyped frame
-rather than failing the ingest.
+weaker, outside the source's domain, or with no source frame inside the window
+stays plain dBZ. Typing is best-effort: a missing or unreadable source ships an
+untyped frame rather than failing the ingest.
 
-`RAD_TYPE_SOURCE` overrides where the codes come from; pointing it at a path
-that does not exist disables typing without a deploy. CLI mode has no
+`RAD_TYPE_SOURCE` overrides where the obs codes come from; pointing it at a
+path that does not exist disables CONUS typing without a deploy. CLI mode has no
 `RAD_OUTPUT` to derive the source from, so it never types — which is why
 `scripts/verify_parity.sh` output is unaffected.
 
-Two things downstream to know before relying on this: radcore's Z-R
+One thing downstream to know before relying on this: radcore's Z-R
 accumulation (`core.zig:1296`, `:1449`) squares the **raw** byte without calling
-`bandNormalize`, so typed snow accumulates ~40x overweight; and default-ramp
-bytes 200..209 render opaque black, i.e. snow at 40..49 dBZ.
+`bandNormalize`, so typed snow accumulates ~40x overweight. (The default ramp's
+black entries at bytes 200..209, which made 40..49 dBZ snow render opaque black,
+were fixed in radcore `2158672`.)
 
 ## RAD3 output
 
