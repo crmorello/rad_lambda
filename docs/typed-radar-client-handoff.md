@@ -44,7 +44,7 @@ line against `recon.zig`:
 | Separator rejection on the accumulation path — `radar.wgsl:240-247` | present |
 | Frame tween `combine` — `radar.wgsl:319-331` | type-aware; snaps at `t=0.5`, never blends through mixed |
 | Hardware bilinear (mode 5) — `radar.wgsl:430-438` | gated on all four taps sharing a band |
-| Palette → continuous under CNN/NWS | correct in **both** clients (`MapLibreRadar.swift:461`, `web/app.js:1284` and `:1435`); matches `radcore/src/tile.zig:91` |
+| Palette → sample class | **both palettes are now type-banded.** The CNN / NWS ramp (colorMode 1) carries its own mixed and snow runs, so it no longer switches to continuous (radcore `tile.zig`, `MapLibreRadar.swift`, `web/app.js` all changed together) |
 | Product metadata over the C ABI | `interp` is read in both (`RadCoreBridge.swift:365`, `web/radcore.js:118`) |
 | Value readout | `zc_product_describe` in both (`ContentView.swift:281`, `web/app.js:1348`) — no local byte→dBZ maths anywhere in either client |
 | `RadarProduct.swift` | **not** a stale copy of the registry; already a thin view over it |

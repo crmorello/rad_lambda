@@ -132,7 +132,8 @@ at `gdal.zig:76` fails at runtime. Also set: `PROJ_NETWORK=OFF`,
 
 ```
 scripts/build_gdal_base.sh          # builds both targets + driver smoke test
-scripts/build_and_push.sh           # SKIP_DEPLOY=1 to build without deploying
+scripts/build_and_push.sh           # build + push to ECR (never deploys)
+scripts/deploy.sh <target> <tag>    # radar | tiles | obs | all
 scripts/verify_parity.sh            # byte-identical RAD vs reference image
 test/e2e_local.sh rad-lambda:local  # MinIO + RIE, full runtime loop
 ```

@@ -83,7 +83,8 @@ Two images, because GDAL is built from source and should not be recompiled on
 every app build:
 
     scripts/build_gdal_base.sh      # rare: rebuilds the minimal GDAL base
-    scripts/build_and_push.sh       # normal: compiles the zig binary, pushes
+    scripts/build_and_push.sh       # normal: compiles the zig binary, pushes to ECR
+    scripts/deploy.sh all <tag>     # rolls a pushed tag out: radar | tiles | obs | all
 
 `Dockerfile.gdal` builds GDAL 3.11.4 + PROJ 9.6.1 with just the three drivers
 this lambda uses (GRIB in, MEM warp target, Parquet for obs) into `/opt/gdal`,
