@@ -121,15 +121,17 @@ pub const Request = struct {
 
 pub const Rendered = struct { png: []u8, empty: bool, frames: usize };
 
-var transparent_256: ?[]u8 = null;
-var transparent_512: ?[]u8 = null;
-
-fn transparent(size: u32) ![]const u8 {
-    const slot = if (size == 512) &transparent_512 else &transparent_256;
-    if (slot.*) |t| return t;
-    slot.* = try radcore.png.transparent(persistent, size, size);
-    return slot.*.?;
-}
+/// The empty tile: a 1×1 fully transparent PNG (8-bit gray+alpha), 68 bytes.
+/// Map clients stretch a raster tile's image over the tile, so 1×1 draws the
+/// same as a full-size blank for both size=256 and size=512 — the old
+/// full-size RGBA blanks were 333 / 1,096 bytes and built at runtime.
+const empty_png = [_]u8{
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5, 0x1c, 0x0c,
+    0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x60, 0x60, 0x00, 0x00,
+    0x00, 0x03, 0x00, 0x01, 0x2b, 0x09, 0x4d, 0x84, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+    0xae, 0x42, 0x60, 0x82,
+};
 
 /// Render one tile from the frames of `stamp` listed in the product manifest.
 /// null = unknown product or stamp. The returned png is arena-owned unless
@@ -169,7 +171,7 @@ pub fn render(arena: std.mem.Allocator, req: Request) !?Rendered {
     });
     if (r.stats.empty) {
         arena.free(r.bytes);
-        return .{ .png = @constCast(try transparent(req.size)), .empty = true, .frames = files.items.len };
+        return .{ .png = @constCast(&empty_png), .empty = true, .frames = files.items.len };
     }
     return .{ .png = r.bytes, .empty = false, .frames = files.items.len };
 }

@@ -43,8 +43,15 @@ pub fn run(alloc: std.mem.Allocator, api: []const u8) !void {
         const arena = arena_state.allocator();
 
         if (handler.handleEvent(arena, body)) |result| {
-            // one summary line per invocation — success is otherwise silent
-            std.debug.print("ok {s} {s}\n", .{ request_id, result });
+            // one summary line per invocation — success is otherwise silent.
+            // Capped: tile responses carry a base64 PNG body, and logging it
+            // whole made CloudWatch ingestion cost more than the compute.
+            const log_cap = 256;
+            if (result.len <= log_cap) {
+                std.debug.print("ok {s} {s}\n", .{ request_id, result });
+            } else {
+                std.debug.print("ok {s} {s}… ({d} bytes)\n", .{ request_id, result[0..log_cap], result.len });
+            }
             try post(&client, alloc, api, request_id, "response", result);
         } else |err| {
             std.debug.print("invocation {s} failed: {s}\n", .{ request_id, @errorName(err) });
